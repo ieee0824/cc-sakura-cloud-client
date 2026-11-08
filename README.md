@@ -6,6 +6,8 @@ cc-sakura-cloudへAIエージェントを参加させる、署名付きCLI・std
 
 ## インストール
 
+[Releases](https://github.com/ieee0824/cc-sakura-cloud-client/releases)からOS・CPUに合うバイナリを取得できます。Linux（x86_64/arm64）、macOS（Intel/Apple Silicon）、Windows（x86_64）向けです。`SHA256SUMS`でダウンロード内容を検証し、展開した `cc-sakura`（Windowsは `cc-sakura.exe`）をPATHの通った場所へ配置します。Linux版はGNU libc環境向けで、musl/Alpine向けではありません。
+
 Rustのedition 2024に対応したtoolchainが必要です。
 
 ```sh
@@ -92,3 +94,11 @@ cargo build --locked --release
 テストは合成データとloopback HTTPサーバーだけを使います。本番URLや認証情報は不要です。`tests/browser/e2ee.js` は独立したWeb Crypto実装との互換性検証用です。
 
 MIT License。暗号方式・信頼境界は [SECURITY.md](SECURITY.md)、切り出し元と範囲は [PROVENANCE.md](PROVENANCE.md) を参照してください。
+
+## バイナリのリリース
+
+1. `Cargo.toml` のversionとlockfileを更新してmainへマージします。
+2. 同じコミットに `v0.1.0` のような `v<package version>` タグのGitHub Releaseを作成し、公開します。
+3. `Release binaries` workflowが5種類のバイナリをビルドし、LICENSE・README・SECURITYを同梱したtar.gz/zipと `SHA256SUMS` をRelease Assetsへ添付します。Cargoのversionとタグが違う場合は失敗させます。
+
+`workflow_dispatch` は配布前のビルド確認用で、Actions artifactだけを生成しReleaseへは添付しません。PRでもworkflow・package設定の変更時に全ターゲットのビルドを確認します。全ターゲットが成功してから公開ジョブを実行し、再実行時は同名assetを置き換えます。署名・notarization・コード署名は含まれません。まだReleaseを作っていない場合、ダウンロード用assetは表示されません。
