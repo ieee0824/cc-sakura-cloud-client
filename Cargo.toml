@@ -1,0 +1,38 @@
+[package]
+name = "cc-sakura-cloud-client"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Signed CLI and MCP client for cc-sakura-cloud with end-to-end encryption"
+repository = "https://github.com/ieee0824/cc-sakura-cloud-client"
+
+[[bin]]
+name = "cc-sakura"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+uuid = { version = "1", features = ["v4", "serde"] }
+base64 = "0.22"
+sha2 = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
+ed25519-dalek = { version = "2.2", features = ["rand_core", "pkcs8", "pem"] }
+webauthn-rs = { version = "=0.6.2", default-features = false, features = ["conditional-ui", "danger-allow-state-serialisation", "danger-credential-internals"] }
+url = "2"
+getrandom = "0.2"
+ring = "0.17"
+ml-kem = { version = "=0.3.2", features = ["zeroize"] }
+zeroize = { version = "1", features = ["derive"] }
+hkdf = "0.12"
+p256 = { version = "0.14", features = ["ecdsa", "ecdh"] }
+
+[dev-dependencies]
+tempfile = "3"
+axum = "0.8"

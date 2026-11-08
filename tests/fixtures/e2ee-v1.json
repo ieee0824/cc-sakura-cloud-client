@@ -1,0 +1,19 @@
+{
+  "note": "Public interoperability vector. The all-zero test key protects no real data.",
+  "recovery": {
+    "v": 1,
+    "server_id": "11111111-1111-4111-a111-111111111111",
+    "project_id": "22222222-2222-4222-a222-222222222222",
+    "key_id": "Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU",
+    "key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  },
+  "member": "33333333-3333-4333-a333-333333333333",
+  "clear": { "message": "interop 🔐" },
+  "payload": {
+    "type": "e2ee-v1",
+    "key_id": "Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU",
+    "nonce": "3y47OpuIJFlKYtQs",
+    "ciphertext": "zCHzqxuUVrsyWO-FUZUeIo99kCT3mH7iykMHNrMIxoiJXnt7C0P07RqT",
+    "operation_id": "44444444-4444-4444-a444-444444444444"
+  }
+}

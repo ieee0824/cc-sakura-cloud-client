@@ -1,0 +1,17 @@
+/target/
+/node_modules/
+*.key
+*.pem
+*.sqlite3*
+*.sqlite*
+*.db*
+*.delivery.json
+*.toml.local
+ccSakura.toml
+ccSakura.*.toml
+!ccSakura.example.toml
+.env
+.env.*
+!.env.example
+*.recovery.json
+*invitation*.txt

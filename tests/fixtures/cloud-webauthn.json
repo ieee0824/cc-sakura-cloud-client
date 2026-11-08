@@ -1,0 +1,27 @@
+{
+  "key_id": "webauthn-p256:Eg_4qjiCSdxtJ3C4R6RnhFa3dHIelSWzCvGhQqaSJRw",
+  "public_key": "{\"origin\":\"https://sakura.example\",\"passkey\":{\"cred\":{\"cred_id\":\"cHVibGljLXRlc3QtY3JlZGVudGlhbC1ub3QtYS1saXZlLWFjY291bnQ\",\"cred\":{\"type_\":\"ES256\",\"key\":{\"EC_EC2\":{\"curve\":\"SECP256R1\",\"x\":\"kBpmaDZrsur9UyZKe3tk0JcwL9L2ETRocPD0Iz-8ldA\",\"y\":\"8XrNH-Ii77TzIF_9wVEENhKf-1pX7E9KgiryDbQiYS4\"}}},\"counter\":0,\"transports\":null,\"user_verified\":true,\"backup_eligible\":false,\"backup_state\":false,\"registration_policy\":\"required\",\"extensions\":{},\"attestation\":{\"data\":\"None\",\"metadata\":\"None\"},\"attestation_format\":\"none\"}}}",
+  "proof": {
+    "scheme": "webauthn-v1",
+    "context": {
+      "server_id": "44444444-4444-4444-a444-444444444444",
+      "project_id": "22222222-2222-4222-a222-222222222222",
+      "member_id": "33333333-3333-4333-a333-333333333333",
+      "endpoint": "/alice/test/web/v1/actions/verify",
+      "action_json": "{\"project_id\":\"22222222-2222-4222-a222-222222222222\",\"op\":\"send\",\"operation_id\":\"55555555-5555-4555-a555-555555555555\",\"args\":{\"payload\":{\"message\":\"Cloudflare / Rust public proof compatibility\"}}}"
+    },
+    "statement": "{\"v\":1,\"purpose\":\"cc-sakura-web-action-v1\",\"server_id\":\"44444444-4444-4444-a444-444444444444\",\"project_id\":\"22222222-2222-4222-a222-222222222222\",\"user_id\":\"11111111-1111-4111-a111-111111111111\",\"member_id\":\"33333333-3333-4333-a333-333333333333\",\"key_id\":\"webauthn-p256:Eg_4qjiCSdxtJ3C4R6RnhFa3dHIelSWzCvGhQqaSJRw\",\"endpoint\":\"/alice/test/web/v1/actions/verify\",\"action_sha256\":\"FtUs_T5oUmJtltKFT5_Q-t4vNW00xWDS4_gPtueRvhQ\",\"iat\":1577836800,\"exp\":1577836920,\"nonce\":\"expired-public-test-fixture\"}",
+    "credential": {
+      "id": "cHVibGljLXRlc3QtY3JlZGVudGlhbC1ub3QtYS1saXZlLWFjY291bnQ",
+      "rawId": "cHVibGljLXRlc3QtY3JlZGVudGlhbC1ub3QtYS1saXZlLWFjY291bnQ",
+      "type": "public-key",
+      "response": {
+        "clientDataJSON": "eyJ0eXBlIjoid2ViYXV0aG4uZ2V0IiwiY2hhbGxlbmdlIjoieW5jOVE0UDVDZGJidi1VRVBXcUc5U05RLTZHcGtwSGIxbjFfQUs3U1ZBbyIsIm9yaWdpbiI6Imh0dHBzOi8vc2FrdXJhLmV4YW1wbGUiLCJjcm9zc09yaWdpbiI6ZmFsc2V9",
+        "authenticatorData": "2HZjuee554XMNGCNtvrWk8JzfnTQ8XUoPk95gBniL0cFAAAAAQ",
+        "signature": "MEYCIQCaVLPKz61m1HB34KwmIB7ld2u-FtXiHSHiZhFF14RcMAIhAPPu_GlKATHjf-z3KEfqQhzEJ7HrVpyaJi9a9otnzLWZ",
+        "userHandle": "ERERERERQRGhEREREREREQ"
+      },
+      "extensions": {}
+    }
+  }
+}

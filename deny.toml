@@ -1,0 +1,8 @@
+[advisories]
+# webauthn-rs 0.6.2 brings rsa through crypto-glue, but cc-sakura restricts
+# WebAuthn credentials to ES256 and performs no RSA private-key operations.
+# RUSTSEC-2023-0071 concerns RSA private-key timing leakage, so this path is
+# unreachable here. Keep the narrow exception visible until upstream removes it.
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "transitive WebAuthn dependency; cc-sakura accepts ES256 only and never performs RSA private-key operations" },
+]
