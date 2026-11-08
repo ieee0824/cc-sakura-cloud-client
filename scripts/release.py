@@ -38,9 +38,13 @@ def package(root, target, output, tag=None):
             for path, filename in files:
                 bundle.write(path, f'{name}/{filename}')
     else:
+        def permissions(info):
+            # Explicit archive permissions also work when tested on Windows.
+            info.mode = 0o755 if Path(info.name).name == executable else 0o644
+            return info
         with tarfile.open(archive, 'w:gz') as bundle:
             for path, filename in files:
-                bundle.add(path, arcname=f'{name}/{filename}', recursive=False)
+                bundle.add(path, arcname=f'{name}/{filename}', recursive=False, filter=permissions)
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     archive.with_name(archive.name + '.sha256').write_text(f'{digest}  {archive.name}\n')
     return archive
