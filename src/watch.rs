@@ -70,9 +70,17 @@ fn private_file(path: &Path) -> Result<File> {
     }
     Ok(options.open(path)?)
 }
+struct WatchLock(File);
+impl Drop for WatchLock {
+    fn drop(&mut self) {
+        // Explicitly release on Linux even if a concurrent fork temporarily
+        // inherited the open file description before exec closes its copy.
+        let _ = self.0.unlock();
+    }
+}
 struct State {
     db: Connection,
-    _lock: File,
+    _lock: WatchLock,
 }
 impl State {
     fn open(path: &Path, scope: &str) -> Result<Self> {
@@ -80,6 +88,7 @@ impl State {
         let lock = private_file(&path.with_extension("watch-lock"))?;
         lock.try_lock()
             .context("another watcher is using this state")?;
+        let lock = WatchLock(lock);
         private_file(path)?;
         let db = Connection::open(path)?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,value TEXT NOT NULL);CREATE TABLE IF NOT EXISTS own_posts(id INTEGER PRIMARY KEY);CREATE TABLE IF NOT EXISTS dispatches(at INTEGER NOT NULL);CREATE INDEX IF NOT EXISTS dispatches_at ON dispatches(at)")?;
@@ -287,7 +296,30 @@ async fn handle(
             json!({"room":options.room,"before":id,"limit":20,"include_human":false}),
         )
         .await?;
-    let event = json!({"v":1,"event_id":format!("{}:{}",client.signed.as_ref().unwrap().auth.project_id,id),"room":options.room,"self_member_id":me,"reason":if mentioned{"mention"}else{"reply"},"message":safe_message(message),"context":context["messages"].as_array().map(|items|items.iter().map(safe_message).collect::<Vec<_>>()).unwrap_or_default()});
+    let mut context = context["messages"].as_array().cloned().unwrap_or_default();
+    // A reply may refer to an old post outside the nearby page. Keep that
+    // explicit evidence, even when our persisted ID index already knows it.
+    for parent in refs(message) {
+        if context.iter().any(|m| m["id"] == parent) {
+            continue;
+        }
+        let page = client
+            .call(
+                "history",
+                json!({"room":options.room,"after":parent-1,"limit":1,"include_human":false}),
+            )
+            .await?;
+        if let Some(found) = page["messages"]
+            .as_array()
+            .and_then(|items| items.iter().find(|m| m["id"] == parent))
+        {
+            context.push(found.clone());
+            if context.len() > 20 {
+                context.remove(0);
+            }
+        }
+    }
+    let event = json!({"v":1,"event_id":format!("{}:{}",client.signed.as_ref().unwrap().auth.project_id,id),"room":options.room,"self_member_id":me,"reason":if mentioned{"mention"}else{"reply"},"message":safe_message(message),"context":context.iter().map(safe_message).collect::<Vec<_>>()});
     state.reserve(id, options.max_events_per_hour)?;
     dispatch(options, &event).await?;
     state.ack(id)?;
