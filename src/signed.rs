@@ -780,6 +780,30 @@ impl SignedClient {
         let response = self.request(http, action, false).await?;
         crate::timing::measure("http.body_and_json", &op, Self::response(response)).await
     }
+    fn decode_legacy_message(&self, message: &mut Value) -> Result<()> {
+        // Encryption authenticates ciphertext, not the original historical author.
+        message["auth"]["verified"] = json!(false);
+        message["auth"]["server_authenticated"] = json!(false);
+        message["auth"]["decrypted"] = json!(false);
+        self.decrypt_history_message(message)
+    }
+    fn decrypt_history_message(&self, message: &mut Value) -> Result<()> {
+        if message["payload"]["type"] == "e2ee-v1" {
+            if let Some(recovery) = self.recovery()? {
+                let clear = crate::timing::measure_sync("e2ee.decrypt", "history", || {
+                    recovery.decrypt(
+                        message["sender"].as_str().context("missing sender")?,
+                        &message["payload"],
+                    )
+                })?;
+                message["encrypted_payload"] = message["payload"].clone();
+                message["payload"] = clear;
+                message["human"] = Value::Null;
+                message["auth"]["decrypted"] = json!(true);
+            }
+        }
+        Ok(())
+    }
     pub async fn verify_history(&self, http: &reqwest::Client, value: Value) -> Result<Value> {
         crate::timing::measure(
             "history.verify_and_decrypt",
@@ -843,7 +867,7 @@ impl SignedClient {
                 .as_str()
                 .context("missing message authentication scheme")?;
             if scheme == "legacy" {
-                message["auth"]["verified"] = json!(false);
+                self.decode_legacy_message(message)?;
                 continue;
             }
             let key_id = auth["key_id"].as_str().context("missing message key ID")?;
@@ -983,20 +1007,7 @@ impl SignedClient {
             let session_authenticated = scheme == "session-v1";
             message["auth"]["verified"] = json!(!session_authenticated);
             message["auth"]["server_authenticated"] = json!(session_authenticated);
-            if message["payload"]["type"] == "e2ee-v1" {
-                if let Some(recovery) = self.recovery()? {
-                    let clear = crate::timing::measure_sync("e2ee.decrypt", "history", || {
-                        recovery.decrypt(
-                            message["sender"].as_str().context("missing sender")?,
-                            &message["payload"],
-                        )
-                    })?;
-                    message["encrypted_payload"] = message["payload"].clone();
-                    message["payload"] = clear;
-                    message["human"] = Value::Null;
-                    message["auth"]["decrypted"] = json!(true);
-                }
-            }
+            self.decrypt_history_message(message)?;
         }
         Ok(value)
     }
@@ -1210,6 +1221,40 @@ impl SignedClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn encrypted_legacy_history_decrypts_without_authenticating_its_author() -> Result<()> {
+        let fixture: Value = serde_json::from_str(include_str!("../tests/fixtures/e2ee-v1.json"))?;
+        let r = &fixture["recovery"];
+        let recovery = crate::e2ee::Recovery::parse(
+            &r.to_string(),
+            r["server_id"].as_str().unwrap(),
+            r["project_id"].as_str().unwrap(),
+        )?;
+        let dir = tempfile::tempdir()?;
+        let c = client(dir.path())?;
+        *c.room_key.lock().unwrap() = Some(recovery);
+        let original = json!({"sender":fixture["member"],"payload":fixture["payload"],"auth":{"scheme":"legacy","verified":true,"server_authenticated":true},"human":"untrusted gloss"});
+        let mut message = original.clone();
+        c.decode_legacy_message(&mut message)?;
+        assert_eq!(message["payload"], fixture["clear"]);
+        assert_eq!(message["encrypted_payload"], fixture["payload"]);
+        assert_eq!(message["auth"]["verified"], false);
+        assert_eq!(message["auth"]["server_authenticated"], false);
+        assert_eq!(message["auth"]["decrypted"], true);
+        assert!(message["human"].is_null());
+        let mut tampered = original.clone();
+        tampered["sender"] = json!("another sender");
+        assert!(c.decode_legacy_message(&mut tampered).is_err());
+        let mut tampered = original;
+        tampered["payload"]["operation_id"] = json!("changed");
+        assert!(c.decode_legacy_message(&mut tampered).is_err());
+        let mut plain = json!({"payload":{"message":"old plaintext"},"auth":{"scheme":"legacy"}});
+        c.decode_legacy_message(&mut plain)?;
+        assert_eq!(plain["payload"]["message"], "old plaintext");
+        assert_eq!(plain["auth"]["verified"], false);
+        assert_eq!(plain["auth"]["decrypted"], false);
+        Ok(())
+    }
     #[tokio::test]
     async fn agent_waits_for_delivery_then_encrypts_before_outbox_and_reloads_after_restart()
     -> Result<()> {
