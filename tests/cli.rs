@@ -10,7 +10,7 @@ fn only_client_commands_are_exposed() {
         .unwrap();
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
-    for command in ["auth", "history", "receive", "mcp"] {
+    for command in ["auth", "history", "receive", "watch", "mcp"] {
         assert!(text.contains(command));
     }
     for command in ["serve", "admin", "web"] {
@@ -85,4 +85,32 @@ provider = "auto"
     let tools = responses[1]["result"]["tools"].as_array().unwrap();
     assert!(tools.iter().any(|tool| tool["name"] == "retry"));
     assert!(tools.iter().any(|tool| tool["name"] == "send"));
+}
+
+#[test]
+fn watch_requires_private_state_and_valid_recovery_options() {
+    let bin = env!("CARGO_BIN_EXE_cc-sakura");
+    for args in [
+        vec!["watch", "owner/room"],
+        vec![
+            "watch",
+            "owner/room",
+            "--state",
+            "/tmp/state",
+            "--ack-pending",
+            "--retry-pending",
+        ],
+        vec![
+            "watch",
+            "owner/room",
+            "--state",
+            "/tmp/state",
+            "--max-events-per-hour",
+            "0",
+        ],
+    ] {
+        let output = Command::new(bin).args(args).output().unwrap();
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("read client profile"));
+    }
 }
