@@ -95,10 +95,20 @@ enum AuthCommand {
         out: PathBuf,
     },
     Join {
-        #[arg(long)]
-        project_url: String,
-        #[arg(long)]
-        token_file: PathBuf,
+        #[arg(
+            long,
+            required_unless_present = "invitation_file",
+            conflicts_with = "invitation_file"
+        )]
+        project_url: Option<String>,
+        #[arg(
+            long,
+            required_unless_present = "invitation_file",
+            conflicts_with = "invitation_file"
+        )]
+        token_file: Option<PathBuf>,
+        #[arg(long, conflicts_with_all = ["project_url", "token_file"])]
+        invitation_file: Option<PathBuf>,
         #[arg(long)]
         private_key_file: PathBuf,
         #[arg(long)]
@@ -130,6 +140,7 @@ async fn main() -> Result<()> {
                 AuthCommand::Join {
                     project_url,
                     token_file,
+                    invitation_file,
                     private_key_file,
                     out,
                     allow_insecure_loopback,
@@ -139,13 +150,30 @@ async fn main() -> Result<()> {
                 out.is_absolute() && !out.exists(),
                 "--out must be a new absolute profile path"
             );
-            let auth = signed::join_agent(
-                project_url,
-                token_file,
-                private_key_file,
-                *allow_insecure_loopback,
-            )
-            .await?;
+            let (project_url, auth) = if let Some(file) = invitation_file {
+                let invitation = signed::read_invitation(file)?;
+                let auth = signed::join_agent_token(
+                    &invitation.room_url,
+                    &invitation.invitation_code,
+                    private_key_file,
+                    *allow_insecure_loopback,
+                )
+                .await?;
+                (invitation.room_url, auth)
+            } else {
+                let url = project_url
+                    .as_deref()
+                    .context("--project-url is required")?;
+                let invitation_path = token_file.as_deref().context("--token-file is required")?;
+                let auth = signed::join_agent(
+                    url,
+                    invitation_path,
+                    private_key_file,
+                    *allow_insecure_loopback,
+                )
+                .await?;
+                (url.to_owned(), auth)
+            };
             let config = Config {
                 project_url: Some(project_url.clone()),
                 auth: Some(auth),
@@ -404,4 +432,53 @@ fn client_from_config(
         http: http.build()?,
         signed,
     })
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    #[test]
+    fn invitation_file_is_an_alternative_to_the_legacy_join_arguments() {
+        let common = [
+            "cc-sakura",
+            "auth",
+            "join",
+            "--private-key-file",
+            "/tmp/agent.key",
+            "--out",
+            "/tmp/room.toml",
+        ];
+        let parse =
+            |extra: &[&str]| Cli::try_parse_from(common.into_iter().chain(extra.iter().copied()));
+        assert!(parse(&["--invitation-file", "/tmp/invite.json"]).is_ok());
+        assert!(
+            parse(&[
+                "--project-url",
+                "https://example.com/owner/room",
+                "--token-file",
+                "/tmp/token.txt"
+            ])
+            .is_ok()
+        );
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["--project-url", "https://example.com/owner/room"]).is_err());
+        assert!(
+            parse(&[
+                "--invitation-file",
+                "/tmp/invite.json",
+                "--token-file",
+                "/tmp/token.txt"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse(&[
+                "--invitation-file",
+                "/tmp/invite.json",
+                "--project-url",
+                "https://example.com/owner/room"
+            ])
+            .is_err()
+        );
+    }
 }

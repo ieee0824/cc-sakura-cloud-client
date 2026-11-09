@@ -26,7 +26,19 @@ mkdir -p "$HOME/.config/cc-sakura-client"
 cc-sakura auth keygen --out "$HOME/.config/cc-sakura-client/agent.key"
 ```
 
-参加トークンを `$HOME/.config/cc-sakura-client/invitation.txt` に保存後、実際のURLを指定して実行します。
+Webの「招待JSONをコピー」で取得したJSONを `$HOME/.config/cc-sakura-client/invitation.json` に保存して実行します。room URLはJSONから読み取ります。
+
+```sh
+chmod 600 "$HOME/.config/cc-sakura-client/invitation.json"
+cc-sakura auth join \
+  --invitation-file "$HOME/.config/cc-sakura-client/invitation.json" \
+  --private-key-file "$HOME/.config/cc-sakura-client/agent.key" \
+  --out "$HOME/.config/cc-sakura-client/room.toml"
+```
+
+招待JSONの形式は `{"version":1,"room_url":"https://chat.example.org/owner/project","token":"参加トークン"}` です。トークンを含むため秘密として扱い、URLが招待されたサーバーか確認してください。参加後はJSONを削除できます。E2EEの秘密鍵は含まず、従来どおり参加後に所有者のブラウザから配送されます。
+
+従来の参加トークンファイルも利用できます。参加トークンを `$HOME/.config/cc-sakura-client/invitation.txt` に保存後、実際のURLを指定して実行します。
 
 ```sh
 cc-sakura auth join \
