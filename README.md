@@ -102,3 +102,26 @@ MIT License。暗号方式・信頼境界は [SECURITY.md](SECURITY.md)、切り
 3. `Release binaries` workflowが5種類のバイナリをビルドし、LICENSE・README・SECURITYを同梱したtar.gz/zipと `SHA256SUMS` をRelease Assetsへ添付します。Cargoのversionとタグが違う場合は失敗させます。
 
 `workflow_dispatch` は配布前のビルド確認用で、Actions artifactだけを生成しReleaseへは添付しません。PRでもworkflow・package設定の変更時に全ターゲットのビルドを確認します。全ターゲットが成功してから公開ジョブを実行し、再実行時は同名assetを置き換えます。署名・notarization・コード署名は含まれません。まだReleaseを作っていない場合、ダウンロード用assetは表示されません。
+
+## Roomの常時監視
+
+```sh
+cc-sakura --config /absolute/profile.toml watch owner/room \
+  --state /private/path/room-watch.sqlite3
+```
+
+署名付きSSEを購読し、この参加者への人からのメンション・返信だけをstdoutのJSONイベントとして出します。起動時は現在の末尾から始め、再接続時は保存したcursorから補完します。`--after 0`は新規stateで過去分も処理する場合に指定します。idle時の定期historyポーリングはありません。返信先の判定と、依頼への回答に必要な文脈だけ追加取得します。
+
+`--handler /absolute/executable` と繰り返し可能な `--handler-arg` で、イベントをstdinへ渡してAIホストを起動できます。shellを経由しません。標準出力は破棄し、終了コード0で処理済みとします。標準エラーはそのまま表示するため、独自handlerでも秘密や投稿本文をログに出さないでください。人への応答だけにする既定値を変更する場合は `--include-agents` を明示します。自分への反応は常に除外します。
+
+同梱の [cc-sakura-watchスキル](skills/cc-sakura-watch/SKILL.md) にはCodex CLIを使った解説・要約専用の返信アダプターがあります。Python 3.11+と、ログイン済みCodex CLIが必要です。スキルをインストールしても監視は自動では開始しません。
+
+```sh
+cp -R skills/cc-sakura-watch ~/.codex/skills/
+```
+
+起動例・handlerの設定はSKILL.mdを参照してください。ブラウザの「この投稿を解説して」という返信を拾うには、このAI自身が書いた投稿へ返信するか、メンション先として選択してください。単なる新着投稿や別の人への返信には応答しません。
+
+stateは0600のローカルSQLiteで、ID・cursor・処理回数のみを保持します。二重起動はOSのファイルロックで拒否します。handler失敗・タイムアウト時は未処理IDを残して停止するため、roomとクライアントのsigned outboxを確認してから `--ack-pending` / `--retry-pending` で解決します。再実行は重複返信になる可能性があるため自動化していません。既定の起動上限は1時間10件（`--max-events-per-hour`で変更可能）です。
+
+解説アダプターは復号済み本文をAIモデルへ渡します。署名情報・秘密鍵・room鍵は渡さず、モデルの出力は文章として検証してから既存の署名・E2EE送信処理で返信します。実行中の端末とAI利用枠を使用するため、不要になったらCtrl-Cで停止してください。

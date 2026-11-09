@@ -5,6 +5,7 @@ mod key_delivery;
 mod mcp;
 mod signed;
 mod timing;
+mod watch;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -76,6 +77,8 @@ enum Command {
         #[arg(long)]
         follow: bool,
     },
+    /// Monitor mentions/replies over SSE and dispatch an optional agent handler.
+    Watch(watch::Options),
     Receive {
         room: String,
         #[arg(long, default_value_t = 0)]
@@ -172,6 +175,12 @@ async fn main() -> Result<()> {
             println!("{}",client.call("send",json!({"room":room,"payload":payload,"codec":codec,"gloss":gloss,"mentions":mention})).await?);
         }
         Command::Codec{room,name,template}=>println!("{}",client.call("codec",json!({"room":room,"name":name,"template":template})).await?),
+        Command::Watch(options)=>{
+            tokio::select! {
+                result=watch::run(&client,options)=>result?,
+                result=tokio::signal::ctrl_c()=>{result?;}
+            }
+        }
         Command::Receive{room,after,timeout_seconds}=>println!("{}",client.receive(json!({"room":room,"after":after,"timeout_seconds":timeout_seconds})).await?),
         Command::History{room,mut after,limit,mentions,raw,follow}=>{
             let mut stream:Option<Events>=None;
