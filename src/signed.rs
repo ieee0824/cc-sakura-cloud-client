@@ -157,6 +157,33 @@ pub fn save_private_profile(path: &Path, text: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoomInvitation {
+    pub version: u8,
+    pub room_url: String,
+    #[serde(rename = "token")]
+    pub invitation_code: String,
+}
+pub fn read_invitation(path: &Path) -> Result<RoomInvitation> {
+    ensure!(path.is_absolute(), "invitation_file must be absolute");
+    private_existing(path)?;
+    ensure!(
+        fs::metadata(path)?.len() <= 8192,
+        "invitation file is too large"
+    );
+    let bytes = fs::read(path)?;
+    strict_json(&bytes).map_err(|_| anyhow::anyhow!("invalid invitation JSON"))?;
+    let invitation: RoomInvitation =
+        serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid invitation fields"))?;
+    ensure!(invitation.version == 1, "unsupported invitation version");
+    ensure!(
+        decode(&invitation.invitation_code, 32)?.len() == 32,
+        "invalid invitation token"
+    );
+    Ok(invitation)
+}
+
 pub async fn join_agent(
     project_url: &str,
     token_file: &Path,
@@ -171,6 +198,21 @@ pub async fn join_agent(
     );
     let invitation = fs::read_to_string(token_file)?;
     let invitation = invitation.trim();
+    join_agent_token(
+        project_url,
+        invitation,
+        private_key_file,
+        allow_insecure_loopback,
+    )
+    .await
+}
+
+pub async fn join_agent_token(
+    project_url: &str,
+    invitation: &str,
+    private_key_file: &Path,
+    allow_insecure_loopback: bool,
+) -> Result<AuthConfig> {
     ensure!(decode(invitation, 32)?.len() == 32, "invalid invitation");
     let mut auth = AuthConfig {
         mode: "signed".into(),
@@ -1429,6 +1471,38 @@ mod tests {
             parse_and_verify(&compact, &URL_SAFE_NO_PAD.encode(expected.as_bytes()))?.member_id,
             joined.auth.member_id
         );
+        let json_path = dir.path().join("invitation.json");
+        save_private_profile(
+            &json_path,
+            &json!({"version":1,"room_url":project_url,"token":fs::read_to_string(&token_path)?})
+                .to_string(),
+        )?;
+        let packaged = read_invitation(&json_path)?;
+        let packaged_auth = join_agent_token(
+            &packaged.room_url,
+            &packaged.invitation_code,
+            &c.auth.private_key_file,
+            true,
+        )
+        .await?;
+        assert_eq!(packaged_auth.member_id, joined.auth.member_id);
+        for url in [
+            "https://example.com/owner/project?token=secret",
+            "https://user:pass@example.com/owner/project",
+            "https://example.com/owner/project/",
+            "http://example.com/owner/project",
+        ] {
+            assert!(
+                join_agent_token(
+                    url,
+                    &packaged.invitation_code,
+                    &c.auth.private_key_file,
+                    false
+                )
+                .await
+                .is_err()
+            );
+        }
         task.abort();
         assert!(
             join_agent(&project_url, &token_path, &c.auth.private_key_file, false)
@@ -1651,6 +1725,39 @@ mod tests {
         assert_eq!(requests[0].action()?.operation_id, Some(operation_id));
         drop(requests);
         task.abort();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod invitation_tests {
+    use super::*;
+    #[test]
+    fn invitation_file_is_strict_versioned_and_private() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("invite.json");
+        let sample_invitation = URL_SAFE_NO_PAD.encode([9u8; 32]);
+        let valid = json!({"version":1,"room_url":"https://example.com/owner/room","token":sample_invitation});
+        save_private_profile(&path, &valid.to_string())?;
+        assert_eq!(read_invitation(&path)?.invitation_code, sample_invitation);
+        for invalid in [
+            json!({"version":2,"room_url":"https://example.com/owner/room","token":sample_invitation}).to_string(),
+            json!({"version":1,"room_url":"https://example.com/owner/room","token":"bad"}).to_string(),
+            json!({"version":1,"room_url":"https://example.com/owner/room","token":sample_invitation,"key":"unexpected"}).to_string(),
+            format!("{{\"version\":1,\"version\":1,\"room_url\":\"https://example.com/owner/room\",\"token\":\"{sample_invitation}\"}}"),
+            "x".repeat(8193),
+        ] {
+            fs::write(&path,invalid)?;
+            assert!(read_invitation(&path).is_err());
+        }
+        assert!(read_invitation(Path::new("invite.json")).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::write(&path, valid.to_string())?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+            assert!(read_invitation(&path).is_err());
+        }
         Ok(())
     }
 }
