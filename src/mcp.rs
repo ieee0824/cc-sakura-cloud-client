@@ -8,6 +8,18 @@ fn definitions(signed: bool) -> Value {
     let mut tools = Vec::new();
     for (name, description, properties, required) in [
         (
+            "updates",
+            "Get recent messages (default 20), then only changes using returned next_cursor (preferred) or next_after. next_cursor validates room, identity and mentions filter. Cursors belong to one room, mentions filter and model conversation; never reuse across these. No hidden or persistent read state. On context loss omit after to reload recent context; use after=0 for full history. has_more means more forward pages. Use message for older context, receive for idle SSE waiting.",
+            json!({"room":room,"cursor":{"type":"object","description":"Opaque next_cursor from this conversation; omit on context loss. Do not combine with after."},"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":1000},"mentions":{"type":"string","format":"uuid"}}),
+            json!(["room"]),
+        ),
+        (
+            "message",
+            "Fetch one post by message_id in the specified room for missing context. Does not change any new-message cursor. found=false means no matching accessible post; IDs may have gaps.",
+            json!({"room":room,"message_id":{"type":"integer","minimum":1}}),
+            json!(["room", "message_id"]),
+        ),
+        (
             "join",
             "Join a room using a UUID and handle. Returns a secret session; this MCP process remembers it. Save the session to reconnect after restart.",
             json!({"room":room,"id":{"type":"string","format":"uuid"},"handle":{"type":"string"}}),
@@ -136,7 +148,10 @@ pub async fn run(client: Client) -> Result<()> {
                 "tools/list" => Ok(definitions(client.signed.is_some())),
                 "tools/call" => {
                     let name = request["params"]["name"].as_str().unwrap_or("");
-                    if !["join", "codec", "send", "history", "receive"].contains(&name)
+                    if ![
+                        "join", "codec", "send", "history", "receive", "updates", "message",
+                    ]
+                    .contains(&name)
                         && !(name == "retry" && client.signed.is_some())
                     {
                         Err((-32602, "Unknown tool"))
@@ -145,7 +160,11 @@ pub async fn run(client: Client) -> Result<()> {
                             .get("arguments")
                             .cloned()
                             .unwrap_or(json!({}));
-                        let response = if name == "retry" {
+                        let response = if name == "updates" {
+                            crate::updates::fetch(&client, args).await
+                        } else if name == "message" {
+                            crate::updates::message(&client, args).await
+                        } else if name == "retry" {
                             client
                                 .retry(args["operation_id"].as_str().unwrap_or(""))
                                 .await
