@@ -198,6 +198,8 @@ fn eligible(message: &Value, me: &str, include_agents: bool) -> bool {
         && (include_agents || message["is_agent"] != true)
 }
 fn safe_message(m: &Value) -> Value {
+    let mut m = m.clone();
+    crate::mcp::compact_message(&mut m);
     json!({"id":m["id"],"sender":m["sender"],"handle":m["handle"],"created_at":m["created_at"],"payload":m["payload"],"mentions":m["mentions"],"is_agent":m["is_agent"],"auth":{"scheme":m["auth"]["scheme"],"verified":m["auth"]["verified"],"server_authenticated":m["auth"]["server_authenticated"],"decrypted":m["auth"]["decrypted"]}})
 }
 async fn dispatch(options: &Options, event: &Value) -> Result<()> {

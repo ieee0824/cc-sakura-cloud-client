@@ -62,9 +62,10 @@ fn definitions(signed: bool) -> Value {
     json!({"tools":tools})
 }
 
-fn model_view(mut value: Value) -> Value {
+pub(crate) fn model_view(mut value: Value) -> Value {
     if let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) {
         for message in messages {
+            compact_message(message);
             if let Some(auth) = message["auth"].as_object_mut() {
                 auth.remove("proof_jws");
                 auth.remove("proof");
@@ -73,6 +74,24 @@ fn model_view(mut value: Value) -> Value {
         }
     }
     value
+}
+
+/// Presentation only: callers must verify and decrypt before projecting messages.
+pub(crate) fn compact_message(message: &mut Value) {
+    if let Some(object) = message.as_object_mut() {
+        object.remove("encrypted_payload");
+    }
+    if let Some(previews) = message["payload"]
+        .get_mut("link_previews")
+        .and_then(Value::as_array_mut)
+    {
+        for preview in previews {
+            if let Some(object) = preview.as_object_mut() {
+                object.remove("thumbnail");
+                object.remove("image_ref");
+            }
+        }
+    }
 }
 
 /// MCP stdio, protocol revision 2025-11-25. Stdout is JSON-RPC only.
@@ -197,6 +216,28 @@ mod tests {
                 .contains(&json!("room"))
         );
     }
+    #[test]
+    fn compact_history_preserves_content_and_trust_without_image_material() {
+        let original = json!({"has_more":true,"messages":[{"id":12,"sender":"alice","payload":{"message":"hello","reply_to":10,"key":"user data","link_previews":[{"url":"https://example.com","title":"Example","thumbnail":{"data":"BASE64"},"image_ref":{"key":"IMAGE_KEY","iv":"IV"}}]},"encrypted_payload":{"ciphertext":"CIPHER"},"auth":{"verified":false,"server_authenticated":true,"decrypted":true,"receipt":{"signature":"PROOF"}}}]});
+        let projected = model_view(original.clone());
+        let message = &projected["messages"][0];
+        assert_eq!(message["payload"]["message"], "hello");
+        assert_eq!(message["payload"]["reply_to"], 10);
+        assert_eq!(message["payload"]["key"], "user data");
+        assert_eq!(
+            message["payload"]["link_previews"][0],
+            json!({"url":"https://example.com","title":"Example"})
+        );
+        assert_eq!(
+            message["auth"],
+            json!({"verified":false,"server_authenticated":true,"decrypted":true})
+        );
+        assert!(message.get("encrypted_payload").is_none());
+        assert_eq!(projected["has_more"], true);
+        assert!(projected.to_string().len() < original.to_string().len());
+        assert!(original["messages"][0].get("encrypted_payload").is_some());
+    }
+
     #[test]
     fn model_view_omits_proof_bytes_but_preserves_verification() {
         let value = model_view(
