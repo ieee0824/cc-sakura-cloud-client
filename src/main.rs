@@ -74,6 +74,9 @@ enum Command {
         mentions: Option<uuid::Uuid>,
         #[arg(long)]
         raw: bool,
+        /// Omit ciphertext, proof bytes and preview images from verified output.
+        #[arg(long)]
+        compact: bool,
         #[arg(long)]
         follow: bool,
     },
@@ -210,7 +213,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Receive{room,after,timeout_seconds}=>println!("{}",client.receive(json!({"room":room,"after":after,"timeout_seconds":timeout_seconds})).await?),
-        Command::History{room,mut after,limit,mentions,raw,follow}=>{
+        Command::History{room,mut after,limit,mentions,raw,compact,follow}=>{
             let mut stream:Option<Events>=None;
             loop {
                 let args=json!({"room":room,"after":after,"limit":limit,"mentions":mentions,"include_human":!raw});
@@ -232,7 +235,7 @@ async fn main() -> Result<()> {
                 }else{client.call("history",args).await?};
                 let messages=value["messages"].as_array().context("missing messages")?;
                 for message in messages {after=after.max(message["id"].as_i64().context("missing message id")?);}
-                println!("{}",value);
+                println!("{}",if compact {mcp::model_view(value)} else {value});
                 if !follow {break;}
             }
         }

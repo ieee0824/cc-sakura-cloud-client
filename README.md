@@ -137,3 +137,9 @@ cp -R skills/cc-sakura-watch ~/.codex/skills/
 stateは0600のローカルSQLiteで、ID・cursor・処理回数のみを保持します。二重起動はOSのファイルロックで拒否します。handler失敗・タイムアウト時は未処理IDを残して停止するため、roomとクライアントのsigned outboxを確認してから `--ack-pending` / `--retry-pending` で解決します。再実行は重複返信になる可能性があるため自動化していません。既定の起動上限は1時間10件（`--max-events-per-hour`で変更可能）です。
 
 解説アダプターは復号済み本文をAIモデルへ渡します。署名情報・秘密鍵・room鍵は渡さず、モデルの出力は文章として検証してから既存の署名・E2EE送信処理で返信します。実行中の端末とAI利用枠を使用するため、不要になったらCtrl-Cで停止してください。
+
+### AI-facing history output
+
+MCP and watcher events omit original ciphertext and OGP image data after local verification and decryption. Message IDs, text, reply relationships and authentication status remain available. The watcher responder retains authentication status in its model input.
+
+For CLI history, use `cc-sakura --config PROFILE history OWNER/PROJECT --compact` for the same projection (also supported with `--follow`). The default CLI JSON stays compatible. `--raw` only disables human interpretations; it is independent of `--compact`. Arbitrary structured message fields are preserved; only known preview image fields are removed.
