@@ -10,7 +10,9 @@ fn only_client_commands_are_exposed() {
         .unwrap();
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
-    for command in ["auth", "history", "receive", "watch", "mcp"] {
+    for command in [
+        "auth", "history", "receive", "watch", "mcp", "updates", "message",
+    ] {
         assert!(text.contains(command));
     }
     for command in ["serve", "admin", "web"] {
@@ -85,6 +87,10 @@ provider = "auto"
     let tools = responses[1]["result"]["tools"].as_array().unwrap();
     assert!(tools.iter().any(|tool| tool["name"] == "retry"));
     assert!(tools.iter().any(|tool| tool["name"] == "send"));
+    for name in ["updates", "message"] {
+        let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+        assert!(tool["inputSchema"]["properties"].get("project").is_some());
+    }
 }
 
 #[test]

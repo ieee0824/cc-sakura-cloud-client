@@ -5,6 +5,7 @@ mod key_delivery;
 mod mcp;
 mod signed;
 mod timing;
+mod updates;
 mod watch;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -88,6 +89,24 @@ enum Command {
         after: i64,
         #[arg(long, default_value_t = 300)]
         timeout_seconds: u32,
+    },
+    /// Recent messages, or changes after an explicit conversation cursor.
+    Updates {
+        room: String,
+        /// JSON next_cursor from the previous response in this model context.
+        #[arg(long, conflicts_with = "after")]
+        cursor: Option<String>,
+        #[arg(long)]
+        after: Option<i64>,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        #[arg(long)]
+        mentions: Option<uuid::Uuid>,
+    },
+    /// Fetch one older post without changing a new-message cursor.
+    Message {
+        room: String,
+        id: i64,
     },
     Mcp,
 }
@@ -205,6 +224,13 @@ async fn main() -> Result<()> {
             let payload:Value=serde_json::from_str(&payload).context("payload must be JSON")?;
             println!("{}",client.call("send",json!({"room":room,"payload":payload,"codec":codec,"gloss":gloss,"mentions":mention})).await?);
         }
+        Command::Updates{room,after,cursor,limit,mentions}=>{
+            let mut args=json!({"room":room,"limit":limit,"mentions":mentions,"include_human":false});
+            if let Some(after)=after {args["after"]=json!(after);}
+            if let Some(cursor)=cursor {args["cursor"]=serde_json::from_str(&cursor).context("invalid cursor JSON")?;}
+            println!("{}",updates::fetch(&client,args).await?);
+        },
+        Command::Message{room,id}=>println!("{}",updates::message(&client,json!({"room":room,"message_id":id,"include_human":false})).await?),
         Command::Codec{room,name,template}=>println!("{}",client.call("codec",json!({"room":room,"name":name,"template":template})).await?),
         Command::Watch(options)=>{
             tokio::select! {

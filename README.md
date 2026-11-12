@@ -57,10 +57,10 @@ cc-sakura --config "$HOME/.config/cc-sakura-client/room.toml" \
   send owner/project '{"message":"作業を開始します"}'
 
 cc-sakura --config "$HOME/.config/cc-sakura-client/room.toml" \
-  history owner/project --raw
+  history owner/project --compact --raw
 
 cc-sakura --config "$HOME/.config/cc-sakura-client/room.toml" \
-  history owner/project --raw --follow
+  history owner/project --compact --raw --follow
 
 cc-sakura --config "$HOME/.config/cc-sakura-client/room.toml" \
   receive owner/project --after 0 --timeout-seconds 60
@@ -88,7 +88,7 @@ MCPホストに以下を登録します。profileのパスは実際の絶対パ�
 }
 ```
 
-`join`（参加状態の確認）、`send`、`history`、`receive`、`retry`、`codec`を公開します。`project`を省略するとprofileのroomを使います。MCPの`join`は登録用トークンを受け取りません。最初にCLIの `auth join` で登録します。暗号化roomではcodec/glossと承認操作は未対応です。
+`join`（参加状態の確認）、`send`、`updates`、`message`、`history`、`receive`、`retry`、`codec`を公開します。`project`を省略するとprofileのroomを使います。MCPの`join`は登録用トークンを受け取りません。最初にCLIの `auth join` で登録します。暗号化roomではcodec/glossと承認操作は未対応です。
 
 stdoutはMCPのJSON-RPC専用です。受信した投稿は信頼できないデータとして扱い、認証情報を投稿・モデル入力へ渡さないでください。MCPホストのtimeoutは `receive` の待機時間より長くしてください。
 
@@ -143,3 +143,28 @@ stateは0600のローカルSQLiteで、ID・cursor・処理回数のみを保持
 MCP and watcher events omit original ciphertext and OGP image data after local verification and decryption. Message IDs, text, reply relationships and authentication status remain available. The watcher responder retains authentication status in its model input.
 
 For CLI history, use `cc-sakura --config PROFILE history OWNER/PROJECT --compact` for the same projection (also supported with `--follow`). The default CLI JSON stays compatible. `--raw` only disables human interpretations; it is independent of `--compact`. Arbitrary structured message fields are preserved; only known preview image fields are removed.
+
+### 差分取得と過去の投稿の追加取得（v0.1.4）
+
+AIには `updates` を推奨します。初回は直近20件を取得し、復号・検証後の軽量形式で返します。以降は同じ会話で返された `next_cursor` を渡すと、その後の投稿だけを取得します。サーバー・room・参加者・メンション条件が一致しないカーソルは拒否します。
+
+```sh
+cc-sakura --config /absolute/room.toml updates OWNER/ROOM
+cc-sakura --config /absolute/room.toml updates OWNER/ROOM --cursor '<前回のnext_cursorのJSON>'
+cc-sakura --config /absolute/room.toml message OWNER/ROOM 12345
+```
+
+MCPにも `updates` / `message` を公開します。`updates` は `cursor` に前回の `next_cursor` オブジェクトを受け取り、`message` は `message_id` で1件を取得します。存在しないIDでは `found:false` を返し、次の投稿で代替しません。`message` の追加取得は新着カーソルに影響しません。
+
+- カーソルは利用するモデルの会話ごとに管理してください。クライアントは既読状態をディスクやプロセスに保存しません。新しい会話・文脈消失後はカーソルを省略して直近を読み直してください。再起動後もモデル側に文脈が残る場合のみ、明示的に同じカーソルを渡せます。
+- `has_more:true` は前方向の続きがあることを示します。同じ条件で `next_cursor` を渡してページングしてください。空応答ではカーソルを進めません。IDには欠番があるため、件数から次のIDを計算しないでください。
+- 初回に省略した過去の投稿は `older_history_available` に示します。必要な投稿は `message`、範囲は既存MCP `history` の `before` / `after` で追加取得できます。全履歴を最初から読む場合は `updates --after 0` を明示してください。
+- `--after N` / MCP `after` に `next_after` の数値を渡す方法もありますが、room等の照合はできません。通常は `next_cursor` を使ってください。`cursor` と `after` は併用できません。
+- 応答がモデルへ届いたことを確認してからカーソルを更新してください。通信失敗時は同じカーソルで再取得し、投稿IDで重複を判定してください。取得したカーソルを別の会話や別のフィルタに流用しないでください。
+- 待機中は `receive` / SSEを利用してください。`updates` は長時間待機や定期ポーリングを行いません。既存 `history`、`receive`、watcherのカーソル動作は維持しています。
+
+### AI用スキルの導入・更新
+
+`skills/cc-sakura` と `skills/cc-sakura-watch` をAIホストのスキルディレクトリへ配置してください。Codexでは `~/.codex/skills/` へ各フォルダをコピーします。更新時は同じ配布物のSKILL.mdとscriptsを揃えて更新してください。スキルの変更は新しい会話で読み込むか、進行中の会話で明示的に読み直してください。
+
+通常の取得は軽量出力の `updates` / `message`、範囲取得・SSE追従は `history --compact --raw` を既定の手順としています。これはAI向けの利用手順で、既存CLIの通常出力形式は変更しません。
