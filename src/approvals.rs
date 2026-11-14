@@ -1,6 +1,7 @@
 //! Encrypted approval metadata. Labels and comments stay inside the ciphertext.
 
 const OTHER_CHOICE: &str = "00000000-0000-4000-8000-000000000000";
+const REJECT_CHOICE: &str = "00000000-0000-4000-8000-000000000001";
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -190,6 +191,7 @@ pub fn decision(
     );
     ensure!(
         (choice == OTHER_CHOICE
+            || choice == REJECT_CHOICE
             || request["approval"]["option_ids"]
                 .as_array()
                 .unwrap()
@@ -221,6 +223,7 @@ pub fn bind_decision(request: &Value, decision: &Value) -> Result<()> {
             && decision["approval"]["request_id"] == request["id"]
             && decision["approval"]["request_digest"] == request["auth"]["action_digest"]
             && (decision["approval"]["choice_id"] == OTHER_CHOICE
+                || decision["approval"]["choice_id"] == REJECT_CHOICE
                 || request["approval"]["option_ids"]
                     .as_array()
                     .unwrap()
@@ -261,6 +264,18 @@ mod tests {
         }
         let mut request = json!({"id":42,"approval":fixture["request"]["approval"],"payload":fixture["request"]["clear"],"auth":{"server_authenticated":true,"approval_verified":true,"action_digest":fixture["request"]["action_digest"]}});
         let choice = fixture["decision"]["clear"]["choice_id"].clone();
+        let rejected = decision(&request, json!(REJECT_CHOICE), None, None)?;
+        assert!(rejected.get("comment").is_none());
+        let rejected_answer = json!({"approval":rejected["approval"],"payload":rejected,"auth":{"verified":true,"approval_verified":true,"approval_authorized":true}});
+        bind_decision(&request, &rejected_answer)?;
+        for field in ["request_id", "request_digest", "choice_id"] {
+            let mut bad = rejected_answer.clone();
+            bad["approval"][field] = json!("tampered");
+            assert!(bind_decision(&request, &bad).is_err());
+        }
+        let mut unauthorized = rejected_answer.clone();
+        unauthorized["auth"]["approval_authorized"] = json!(false);
+        assert!(bind_decision(&request, &unauthorized).is_err());
         assert!(decision(&request, json!(OTHER_CHOICE), None, None).is_err());
         assert!(decision(&request, json!(OTHER_CHOICE), Some(json!(" ")), None).is_err());
         let other = decision(
