@@ -1,3 +1,4 @@
+mod approvals;
 mod browser_proof;
 mod diagnostics;
 mod e2ee;
@@ -108,7 +109,40 @@ enum Command {
         room: String,
         id: i64,
     },
+    Approval {
+        #[command(subcommand)]
+        command: ApprovalCommand,
+    },
     Mcp,
+}
+#[derive(Subcommand)]
+enum ApprovalCommand {
+    Request {
+        room: String,
+        title: String,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long, required=true, num_args=1..=8)]
+        option: Vec<String>,
+    },
+    List {
+        room: String,
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    Show {
+        room: String,
+        request_id: u64,
+    },
+    Decide {
+        room: String,
+        request_id: u64,
+        choice_id: uuid::Uuid,
+        #[arg(long)]
+        comment: Option<String>,
+    },
 }
 #[derive(Subcommand)]
 enum AuthCommand {
@@ -218,6 +252,15 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Auth{command:AuthCommand::Retry{operation_id}}=>println!("{}",client.retry(&operation_id).await?),
         Command::Auth{..}=>unreachable!(),
+        Command::Approval{command}=> {
+            let (op,args)=match command {
+                ApprovalCommand::Request{room,title,description,option}=>("request_approval",json!({"room":room,"title":title,"description":description,"options":option})),
+                ApprovalCommand::List{room,after,limit}=>("approvals",json!({"room":room,"after":after,"limit":limit})),
+                ApprovalCommand::Show{room,request_id}=>("approval",json!({"room":room,"request_id":request_id})),
+                ApprovalCommand::Decide{room,request_id,choice_id,comment}=>("decide_approval",json!({"room":room,"request_id":request_id,"choice_id":choice_id,"comment":comment})),
+            };
+            println!("{}",mcp::model_view(client.call(op,args).await?));
+        },
         Command::Mcp=>mcp::run(client).await?,
         Command::Join{room,handle,id}=>println!("{}",client.call("join",json!({"room":room,"handle":handle,"id":id.map(|v|v.to_string()).unwrap_or_else(||client.signed.as_ref().unwrap().auth.member_id.clone())})).await?),
         Command::Send{room,payload,codec,gloss,mention}=>{

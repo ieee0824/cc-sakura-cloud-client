@@ -69,20 +69,68 @@ fn definitions(signed: bool) -> Value {
                 );
             }
         }
+        for (name, description, properties, required) in [
+            (
+                "request_approval",
+                "Send an E2EE approval request with 1–8 unique choice labels. Requires a supporting server. No command is executed automatically.",
+                json!({"title":{"type":"string"},"description":{"type":"string"},"options":{"type":"array","minItems":1,"maxItems":8,"uniqueItems":true,"items":{"type":"string"}},"mentions":{"type":"array","items":{"type":"string","format":"uuid"}}}),
+                json!(["title", "options"]),
+            ),
+            (
+                "decide_approval",
+                "Answer an encrypted approval request. Fetches and verifies the original request and choice ID before sending. Requires current approver permission. Reuse retry after an ambiguous failure.",
+                json!({"request_id":{"type":"integer","minimum":1},"choice_id":{"type":"string","format":"uuid"},"comment":{"type":"string"}}),
+                json!(["request_id", "choice_id"]),
+            ),
+            (
+                "approvals",
+                "List pending approval requests, verifying and decrypting each. Failed items remain visible with approval_verified=false. Use SSE receive to wait for changes instead of polling.",
+                json!({"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":100}}),
+                json!([]),
+            ),
+            (
+                "approval",
+                "Fetch one request and its answer. Check approval_verified on both and approval_target_verified on the decision. Server-authenticated browser records are distinct from user signatures. An answer is not authorization for arbitrary commands.",
+                json!({"request_id":{"type":"integer","minimum":1}}),
+                json!(["request_id"]),
+            ),
+        ] {
+            let mut properties = properties;
+            properties["project"] = json!({"type":"string","description":"Configured owner/project; omit to use the configured room."});
+            properties["room"] = json!({"type":"string","description":"Configured owner/project or explicit compatibility alias."});
+            tools.push(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}}));
+        }
         tools.push(json!({"name":"retry","description":"Recover a previously saved signed update by operation ID. Reuses the exact action; do not create another send after an ambiguous network failure.","inputSchema":{"type":"object","properties":{"operation_id":{"type":"string","format":"uuid"}},"required":["operation_id"],"additionalProperties":false}}));
     }
     json!({"tools":tools})
 }
 
 pub(crate) fn model_view(mut value: Value) -> Value {
+    fn project(message: &mut Value) {
+        compact_message(message);
+        if let Some(auth) = message.get_mut("auth").and_then(Value::as_object_mut) {
+            for key in ["proof_jws", "proof", "receipt"] {
+                auth.remove(key);
+            }
+        }
+    }
     if let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) {
         for message in messages {
-            compact_message(message);
-            if let Some(auth) = message["auth"].as_object_mut() {
-                auth.remove("proof_jws");
-                auth.remove("proof");
-                auth.remove("receipt");
+            project(message);
+        }
+    }
+    if let Some(entries) = value.get_mut("requests").and_then(Value::as_array_mut) {
+        for entry in entries {
+            for key in ["request", "decision"] {
+                if !entry[key].is_null() {
+                    project(&mut entry[key]);
+                }
             }
+        }
+    }
+    for key in ["request", "decision"] {
+        if let Some(message) = value.get_mut(key).filter(|v| !v.is_null()) {
+            project(message);
         }
     }
     value
@@ -92,6 +140,14 @@ pub(crate) fn model_view(mut value: Value) -> Value {
 pub(crate) fn compact_message(message: &mut Value) {
     if let Some(object) = message.as_object_mut() {
         object.remove("encrypted_payload");
+    }
+    if message["auth"]["approval_verified"] == true
+        && !message["approval"].is_null()
+        && message["payload"]["approval"] == message["approval"]
+    {
+        if let Some(payload) = message["payload"].as_object_mut() {
+            payload.remove("approval");
+        }
     }
     if let Some(previews) = message["payload"]
         .get_mut("link_previews")
@@ -152,7 +208,15 @@ pub async fn run(client: Client) -> Result<()> {
                         "join", "codec", "send", "history", "receive", "updates", "message",
                     ]
                     .contains(&name)
-                        && !(name == "retry" && client.signed.is_some())
+                        && !([
+                            "retry",
+                            "request_approval",
+                            "decide_approval",
+                            "approvals",
+                            "approval",
+                        ]
+                        .contains(&name)
+                            && client.signed.is_some())
                     {
                         Err((-32602, "Unknown tool"))
                     } else {

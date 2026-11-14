@@ -173,13 +173,12 @@ impl Recovery {
         ]))?)
     }
     pub fn encrypt(&self, member: &str, operation: &str, payload: &Value) -> Result<Value> {
-        ensure!(
-            !matches!(
-                payload["type"].as_str(),
-                Some("approval_request" | "approval_decision")
-            ),
-            "encrypted approvals are not supported yet"
-        );
+        if matches!(
+            payload["type"].as_str(),
+            Some("approval_request" | "approval_decision")
+        ) {
+            crate::approvals::content(&payload["approval"], payload)?;
+        }
         let mut nonce = [0u8; 12];
         getrandom::getrandom(&mut nonce)
             .map_err(|_| anyhow::anyhow!("OS randomness unavailable"))?;

@@ -847,10 +847,56 @@ impl SignedClient {
         Ok(())
     }
     pub async fn verify_history(&self, http: &reqwest::Client, value: Value) -> Result<Value> {
+        let mut value = value;
+        if value.get("requests").is_some() || value.get("request").is_some() {
+            let mut entries = value
+                .get("requests")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_else(|| {
+                    vec![json!({"request":value["request"],"decision":value["decision"]})]
+                });
+            // Fetch project keys once for the whole page, not once per request.
+            let messages: Vec<_> = entries
+                .iter()
+                .flat_map(|entry| [entry["request"].clone(), entry["decision"].clone()])
+                .filter(|message| !message.is_null())
+                .collect();
+            let mut page =
+                json!({"messages":messages,"encryption_key_id":value["encryption_key_id"]});
+            page = self.verify_history_inner(http, page, true).await?;
+            let mut messages = page["messages"]
+                .as_array()
+                .context("missing approval messages")?
+                .iter();
+            for entry in &mut entries {
+                for field in ["request", "decision"] {
+                    if !entry[field].is_null() {
+                        entry[field] = messages
+                            .next()
+                            .context("missing verified approval")?
+                            .clone();
+                    }
+                }
+                if !entry["decision"].is_null() {
+                    let valid =
+                        crate::approvals::bind_decision(&entry["request"], &entry["decision"])
+                            .is_ok();
+                    entry["decision"]["auth"]["approval_target_verified"] = json!(valid);
+                }
+            }
+            if value.get("requests").is_some() {
+                value["requests"] = json!(entries);
+            } else {
+                value["request"] = entries[0]["request"].clone();
+                value["decision"] = entries[0]["decision"].clone();
+            }
+            return Ok(value);
+        }
         crate::timing::measure(
             "history.verify_and_decrypt",
             "history",
-            self.verify_history_inner(http, value),
+            self.verify_history_inner(http, value, false),
         )
         .await
     }
@@ -858,6 +904,7 @@ impl SignedClient {
         &self,
         http: &reqwest::Client,
         mut value: Value,
+        tolerate_errors: bool,
     ) -> Result<Value> {
         if value["messages"]
             .as_array()
@@ -902,154 +949,190 @@ impl SignedClient {
             .as_array()
             .context("missing project public keys")?;
         for message in value["messages"].as_array_mut().unwrap() {
-            let auth = message
-                .get("auth")
-                .context("missing message authentication metadata")?;
-            let scheme = auth["scheme"]
-                .as_str()
-                .context("missing message authentication scheme")?;
-            if scheme == "legacy" {
-                self.decode_legacy_message(message)?;
-                continue;
-            }
-            let key_id = auth["key_id"].as_str().context("missing message key ID")?;
-            let key = keys
-                .iter()
-                .find(|k| k["key_id"] == key_id)
-                .context("message key is not registered in this project")?;
-            let public_key = key["public_key"].as_str().context("missing public key")?;
-            let (action_raw, member_id, server_id) = match scheme {
-                "signed-v1" => {
-                    ensure!(key["kind"] == "ed25519", "signature/key type mismatch");
-                    let proof = auth["proof_jws"].as_str().context("missing JWS proof")?;
-                    let request = parse_and_verify(proof, public_key)?;
-                    ensure!(request.key_id == key_id, "proof key ID mismatch");
-                    (request.action, request.member_id, request.aud)
+            let checked = (|| -> Result<()> {
+                let auth = message
+                    .get("auth")
+                    .context("missing message authentication metadata")?;
+                let scheme = auth["scheme"]
+                    .as_str()
+                    .context("missing message authentication scheme")?;
+                if scheme == "legacy" {
+                    self.decode_legacy_message(message)?;
+                    return Ok(());
                 }
-                "webauthn-v1" => {
-                    ensure!(key["kind"] == "webauthn", "signature/key type mismatch");
-                    let proof = auth.get("proof").context("missing WebAuthn proof")?;
-                    let context = crate::browser_proof::verify_proof(proof, public_key)?;
-                    let claims = strict_json(
-                        proof["statement"]
-                            .as_str()
-                            .context("missing WebAuthn statement")?
-                            .as_bytes(),
-                    )?;
-                    ensure!(
-                        claims["user_id"] == key["user_id"],
-                        "proof user differs from registered key owner"
-                    );
-                    let raw = context["action_json"]
-                        .as_str()
-                        .context("missing signed action")?;
-                    strict_json(raw.as_bytes())?;
-                    (
-                        RawValue::from_string(raw.into())?,
-                        context["member_id"]
-                            .as_str()
-                            .context("missing signed member")?
-                            .into(),
-                        context["server_id"]
-                            .as_str()
-                            .context("missing signed server")?
-                            .into(),
-                    )
-                }
-                "session-v1" => {
-                    // A hosted browser post is authenticated by the server's
-                    // session checks. The receipt is not a user's signature.
-                    ensure!(key["kind"] == "webauthn", "session key type mismatch");
-                    let receipt = auth.get("receipt").context("missing session receipt")?;
-                    ensure!(
-                        receipt["key_id"] == key_id && receipt["user_id"] == key["user_id"],
-                        "session receipt owner mismatch"
-                    );
-                    ensure!(
-                        receipt["project_id"] == self.auth.project_id,
-                        "session receipt project mismatch"
-                    );
-                    let raw = receipt["action_json"]
-                        .as_str()
-                        .context("missing session action")?;
-                    strict_json(raw.as_bytes())?;
-                    (
-                        RawValue::from_string(raw.into())?,
-                        receipt["member_id"]
-                            .as_str()
-                            .context("missing session member")?
-                            .into(),
-                        receipt["server_id"]
-                            .as_str()
-                            .context("missing session server")?
-                            .into(),
-                    )
-                }
-                _ => bail!("unsupported message signature scheme"),
-            };
-            let action: Action = serde_json::from_str(action_raw.get())?;
-            ensure!(
-                key["member_id"] == member_id,
-                "proof member differs from registered key binding"
-            );
-            ensure!(
-                server_id == self.auth.server_id
-                    && action.project_id == self.auth.project_id
-                    && action.op == "send",
-                "message proof has the wrong server, project or operation"
-            );
-            ensure!(
-                message["sender"] == member_id && message["payload"] == action.args["payload"],
-                "message display differs from signed author or payload"
-            );
-            ensure!(
-                auth["action_digest"] == digest(action_raw.get().as_bytes()),
-                "message action digest mismatch"
-            );
-            let mentions = |value: &Value| -> Result<std::collections::BTreeSet<String>> {
-                match value {
-                    Value::Null => Ok(Default::default()),
-                    Value::Array(values) => values
-                        .iter()
-                        .map(|v| Ok(v.as_str().context("invalid mention")?.to_owned()))
-                        .collect(),
-                    _ => bail!("invalid mentions"),
-                }
-            };
-            ensure!(
-                mentions(&message["mentions"])? == mentions(&action.args["mentions"])?,
-                "message mentions differ from signed mentions"
-            );
-            ensure!(
-                message["codec"] == action.args["codec"],
-                "message codec differs from signed codec"
-            );
-            if let Some(codec) = action.args["codec"].as_str() {
-                let template = codecs
+                let key_id = auth["key_id"].as_str().context("missing message key ID")?;
+                let key = keys
                     .iter()
-                    .find(|c| c["name"] == codec)
-                    .and_then(|c| c["template"].as_str())
-                    .context("missing signed codec definition")?;
+                    .find(|k| k["key_id"] == key_id)
+                    .context("message key is not registered in this project")?;
+                let public_key = key["public_key"].as_str().context("missing public key")?;
+                let (action_raw, member_id, server_id) = match scheme {
+                    "signed-v1" => {
+                        ensure!(key["kind"] == "ed25519", "signature/key type mismatch");
+                        let proof = auth["proof_jws"].as_str().context("missing JWS proof")?;
+                        let request = parse_and_verify(proof, public_key)?;
+                        ensure!(request.key_id == key_id, "proof key ID mismatch");
+                        (request.action, request.member_id, request.aud)
+                    }
+                    "webauthn-v1" => {
+                        ensure!(key["kind"] == "webauthn", "signature/key type mismatch");
+                        let proof = auth.get("proof").context("missing WebAuthn proof")?;
+                        let context = crate::browser_proof::verify_proof(proof, public_key)?;
+                        let claims = strict_json(
+                            proof["statement"]
+                                .as_str()
+                                .context("missing WebAuthn statement")?
+                                .as_bytes(),
+                        )?;
+                        ensure!(
+                            claims["user_id"] == key["user_id"],
+                            "proof user differs from registered key owner"
+                        );
+                        let raw = context["action_json"]
+                            .as_str()
+                            .context("missing signed action")?;
+                        strict_json(raw.as_bytes())?;
+                        (
+                            RawValue::from_string(raw.into())?,
+                            context["member_id"]
+                                .as_str()
+                                .context("missing signed member")?
+                                .into(),
+                            context["server_id"]
+                                .as_str()
+                                .context("missing signed server")?
+                                .into(),
+                        )
+                    }
+                    "session-v1" => {
+                        // A hosted browser post is authenticated by the server's
+                        // session checks. The receipt is not a user's signature.
+                        ensure!(key["kind"] == "webauthn", "session key type mismatch");
+                        let receipt = auth.get("receipt").context("missing session receipt")?;
+                        ensure!(
+                            receipt["key_id"] == key_id && receipt["user_id"] == key["user_id"],
+                            "session receipt owner mismatch"
+                        );
+                        ensure!(
+                            receipt["project_id"] == self.auth.project_id,
+                            "session receipt project mismatch"
+                        );
+                        let raw = receipt["action_json"]
+                            .as_str()
+                            .context("missing session action")?;
+                        strict_json(raw.as_bytes())?;
+                        (
+                            RawValue::from_string(raw.into())?,
+                            receipt["member_id"]
+                                .as_str()
+                                .context("missing session member")?
+                                .into(),
+                            receipt["server_id"]
+                                .as_str()
+                                .context("missing session server")?
+                                .into(),
+                        )
+                    }
+                    _ => bail!("unsupported message signature scheme"),
+                };
+                let action: Action = serde_json::from_str(action_raw.get())?;
                 ensure!(
-                    action.args["codec_digest"] == digest(template.as_bytes()),
-                    "codec definition differs from signed digest"
+                    key["member_id"] == member_id,
+                    "proof member differs from registered key binding"
                 );
-                if let Some(human) = message.get("human").and_then(Value::as_str) {
+                ensure!(
+                    server_id == self.auth.server_id
+                        && action.project_id == self.auth.project_id
+                        && action.op == "send",
+                    "message proof has the wrong server, project or operation"
+                );
+                ensure!(
+                    message["sender"] == member_id
+                        && message["payload"] == action.args["payload"]
+                        && message["approval"] == action.args["approval"],
+                    "message display differs from signed author or payload"
+                );
+                ensure!(
+                    auth["action_digest"] == digest(action_raw.get().as_bytes()),
+                    "message action digest mismatch"
+                );
+                let mentions = |value: &Value| -> Result<std::collections::BTreeSet<String>> {
+                    match value {
+                        Value::Null => Ok(Default::default()),
+                        Value::Array(values) => values
+                            .iter()
+                            .map(|v| Ok(v.as_str().context("invalid mention")?.to_owned()))
+                            .collect(),
+                        _ => bail!("invalid mentions"),
+                    }
+                };
+                ensure!(
+                    mentions(&message["mentions"])? == mentions(&action.args["mentions"])?,
+                    "message mentions differ from signed mentions"
+                );
+                ensure!(
+                    message["codec"] == action.args["codec"],
+                    "message codec differs from signed codec"
+                );
+                if let Some(codec) = action.args["codec"].as_str() {
+                    let template = codecs
+                        .iter()
+                        .find(|c| c["name"] == codec)
+                        .and_then(|c| c["template"].as_str())
+                        .context("missing signed codec definition")?;
                     ensure!(
-                        render_codec(template, &action.args["payload"])? == human,
-                        "rendered human text differs from signed codec"
+                        action.args["codec_digest"] == digest(template.as_bytes()),
+                        "codec definition differs from signed digest"
+                    );
+                    if let Some(human) = message.get("human").and_then(Value::as_str) {
+                        ensure!(
+                            render_codec(template, &action.args["payload"])? == human,
+                            "rendered human text differs from signed codec"
+                        );
+                    }
+                } else if let Some(human) = message.get("human").and_then(Value::as_str) {
+                    ensure!(
+                        action.args["gloss"].as_str().unwrap_or("") == human,
+                        "message gloss differs from signed gloss"
                     );
                 }
-            } else if let Some(human) = message.get("human").and_then(Value::as_str) {
-                ensure!(
-                    action.args["gloss"].as_str().unwrap_or("") == human,
-                    "message gloss differs from signed gloss"
-                );
+                let session_authenticated = scheme == "session-v1";
+                message["auth"]["verified"] = json!(!session_authenticated);
+                message["auth"]["server_authenticated"] = json!(session_authenticated);
+                if let Err(error) = self.decrypt_history_message(message) {
+                    if message["approval"].is_null() {
+                        return Err(error);
+                    }
+                    message["auth"]["decrypted"] = json!(false);
+                    message["auth"]["approval_error"] = json!("approval_decryption_failed");
+                }
+                if !message["approval"].is_null()
+                    || matches!(
+                        message["payload"]["type"].as_str(),
+                        Some("approval_request" | "approval_decision")
+                    ) && message.get("encrypted_payload").is_some()
+                {
+                    let valid = action.args["payload"]["type"] == "e2ee-v1"
+                        && message["auth"]["decrypted"] == true
+                        && crate::approvals::content(&message["approval"], &message["payload"])
+                            .is_ok();
+                    message["auth"]["approval_verified"] = json!(valid);
+                    message["auth"]["approval_target_verified"] = json!(false);
+                    if !valid {
+                        message["auth"]["approval_error"] = json!("approval_content_mismatch");
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = checked {
+                if !tolerate_errors {
+                    return Err(error);
+                }
+                message["auth"]["verified"] = json!(false);
+                message["auth"]["server_authenticated"] = json!(false);
+                message["auth"]["approval_verified"] = json!(false);
+                message["auth"]["approval_error"] = json!("approval_verification_failed");
             }
-            let session_authenticated = scheme == "session-v1";
-            message["auth"]["verified"] = json!(!session_authenticated);
-            message["auth"]["server_authenticated"] = json!(session_authenticated);
-            self.decrypt_history_message(message)?;
         }
         Ok(value)
     }
@@ -1075,7 +1158,9 @@ impl SignedClient {
         let mut args = self.target(&args)?;
         let requested_id = args.get("id").cloned();
         let requested_handle = args.get("handle").cloned();
-        let op = if operation == "join" {
+        let op = if matches!(operation, "request_approval" | "decide_approval") {
+            "send"
+        } else if operation == "join" {
             "identity"
         } else {
             operation
@@ -1088,6 +1173,16 @@ impl SignedClient {
                 );
             }
             args = json!({});
+        }
+        if operation == "request_approval" {
+            let payload = crate::approvals::request(
+                args["title"].clone(),
+                args.get("description").filter(|v| !v.is_null()).cloned(),
+                args["options"].clone(),
+            )?;
+            args = json!({"payload":payload,"mentions":args.get("mentions").cloned().unwrap_or(json!([]))});
+        } else if operation == "decide_approval" {
+            args = json!({"payload":{"type":"approval_decision","reply_to":args["request_id"],"choice_id":args["choice_id"],"comment":args.get("comment").filter(|v|!v.is_null()).cloned()}});
         }
         if matches!(op, "send" | "codec") {
             let identity = self
@@ -1117,40 +1212,77 @@ impl SignedClient {
                         && args["gloss"].is_null(),
                     "encrypted codecs and gloss are not supported"
                 );
-                ensure!(
-                    !matches!(
-                        args["payload"]["type"].as_str(),
-                        Some("approval_request" | "approval_decision")
-                    ),
-                    "encrypted approvals are not supported yet"
-                );
+                if matches!(
+                    args["payload"]["type"].as_str(),
+                    Some("approval_request" | "approval_decision")
+                ) {
+                    ensure!(
+                        identity["capabilities"]["e2ee_approvals"]
+                            .as_array()
+                            .is_some_and(|versions| versions.contains(&json!(1))),
+                        "server must be upgraded for encrypted approvals"
+                    );
+                }
             }
         }
-        if op == "send"
-            && args["payload"]["type"] == "approval_decision"
-            && args["payload"].get("request_digest").is_none()
-        {
+        if op == "send" && args["payload"]["type"] == "approval_decision" {
             let id = args["payload"]["reply_to"]
-                .as_i64()
-                .context("approval reply_to must be one message ID")?;
-            ensure!(id > 0, "invalid approval request ID");
-            let lookup = self.action(
-                "history",
-                json!({"after":id-1,"before":id+1,"limit":1}),
-                None,
-            )?;
-            let history = self
-                .verify_history(http, self.send_action(http, &lookup).await?)
-                .await?;
-            let request = history["messages"]
-                .as_array()
-                .and_then(|ms| ms.iter().find(|m| m["id"] == id))
-                .context("approval request not found")?;
-            ensure!(
-                request["auth"]["verified"] == true,
-                "approval requires a signed request"
-            );
-            args["payload"]["request_digest"] = request["auth"]["action_digest"].clone();
+                .as_u64()
+                .filter(|id| *id > 0)
+                .context("invalid approval request ID")?;
+            if self.recovery()?.is_some() {
+                let detail = self
+                    .send_action(
+                        http,
+                        &self.action("approval", json!({"request_id":id}), None)?,
+                    )
+                    .await?;
+                let detail = self.verify_history(http, detail).await?;
+                ensure!(
+                    detail["request"]["id"] == id,
+                    "approval response target mismatch"
+                );
+                ensure!(detail["decision"].is_null(), "request already answered");
+                let payload = crate::approvals::decision(
+                    &detail["request"],
+                    args["payload"]["choice_id"].clone(),
+                    args["payload"]
+                        .get("comment")
+                        .filter(|v| !v.is_null())
+                        .cloned(),
+                    args["payload"].get("request_digest"),
+                )?;
+                if let Some(supplied) = args["payload"].get("approval") {
+                    ensure!(
+                        supplied == &payload["approval"],
+                        "approval metadata mismatch"
+                    );
+                }
+                args["payload"] = payload;
+            } else {
+                let page = self
+                    .send_action(
+                        http,
+                        &self.action("history", json!({"after":id-1,"limit":1}), None)?,
+                    )
+                    .await?;
+                let page = self.verify_history(http, page).await?;
+                let request = page["messages"]
+                    .as_array()
+                    .and_then(|ms| ms.iter().find(|m| m["id"] == id))
+                    .context("approval request not found")?;
+                ensure!(
+                    crate::approvals::authenticated(request),
+                    "approval requires authenticated request"
+                );
+                if let Some(supplied) = args["payload"].get("request_digest") {
+                    ensure!(
+                        supplied == &request["auth"]["action_digest"],
+                        "approval request digest mismatch"
+                    );
+                }
+                args["payload"]["request_digest"] = request["auth"]["action_digest"].clone();
+            }
         }
         if op == "send"
             && let Some(codec) = args.get("codec").and_then(Value::as_str)
@@ -1164,6 +1296,12 @@ impl SignedClient {
                 .context("codec not returned by project")?;
             args["codec_digest"] = json!(digest(template.as_bytes()));
         }
+        if matches!(operation, "request_approval" | "decide_approval") {
+            ensure!(
+                self.recovery()?.is_some(),
+                "approval helpers require an encrypted room"
+            );
+        }
         let operation_id = matches!(op, "send" | "codec").then(|| Uuid::new_v4().to_string());
         if let Some(recovery) = self.recovery()? {
             ensure!(op != "codec", "codecs are not supported with encryption");
@@ -1174,6 +1312,24 @@ impl SignedClient {
                         && args["gloss"].is_null(),
                     "encrypted posts cannot contain codec or gloss"
                 );
+                if matches!(
+                    args["payload"]["type"].as_str(),
+                    Some("approval_request" | "approval_decision")
+                ) {
+                    crate::approvals::content(&args["payload"]["approval"], &args["payload"])?;
+                    if let Some(supplied) = args.get("approval") {
+                        ensure!(
+                            supplied == &args["payload"]["approval"],
+                            "approval metadata mismatch"
+                        );
+                    }
+                    args["approval"] = args["payload"]["approval"].clone();
+                } else {
+                    ensure!(
+                        args.get("approval").is_none(),
+                        "unexpected approval metadata"
+                    );
+                }
                 args["payload"] = crate::timing::measure_sync("e2ee.encrypt", "send", || {
                     recovery.encrypt(
                         &self.auth.member_id,
@@ -1263,6 +1419,162 @@ impl SignedClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn encrypted_approvals_interoperate_with_browser_records_and_preserve_failed_items()
+    -> Result<()> {
+        use axum::{Json, Router, routing::post};
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+        let dir = tempfile::tempdir()?;
+        let initial = client(dir.path())?;
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/e2ee-approvals-v1.json"))?;
+        let mut bundle = fixture["recovery"].clone();
+        bundle["server_id"] = json!(initial.auth.server_id);
+        bundle["project_id"] = json!(initial.auth.project_id);
+        let recovery = crate::e2ee::Recovery::parse(
+            &bundle.to_string(),
+            &initial.auth.server_id,
+            &initial.auth.project_id,
+        )?;
+        let browser_member = Uuid::new_v4().to_string();
+        let operation = Uuid::new_v4().to_string();
+        let payload =
+            recovery.encrypt(&browser_member, &operation, &fixture["request"]["clear"])?;
+        let raw = serde_json::to_string(&Action {
+            operation_id: Some(operation),
+            op: "send".into(),
+            project_id: initial.auth.project_id.clone(),
+            args: json!({"payload":payload,"approval":fixture["request"]["approval"]}),
+        })?;
+        let request = json!({"id":42,"sender":browser_member,"payload":payload,"approval":fixture["request"]["approval"],"auth":{"scheme":"session-v1","key_id":"browser-key","action_digest":digest(raw.as_bytes()),"receipt":{"key_id":"browser-key","user_id":"browser-user","project_id":initial.auth.project_id,"server_id":initial.auth.server_id,"member_id":browser_member,"action_json":raw}}});
+        let records = Arc::new(Mutex::new(vec![request.clone()]));
+        let capable = Arc::new(AtomicBool::new(true));
+        let state = records.clone();
+        let supported = capable.clone();
+        let server = initial.auth.server_id.clone();
+        let project = initial.auth.project_id.clone();
+        let member = initial.auth.member_id.clone();
+        let key_id = key_id(initial.key.verifying_key().as_bytes());
+        let public = URL_SAFE_NO_PAD.encode(initial.key.verifying_key().as_bytes());
+        let server_bundle = bundle.clone();
+        let app=Router::new().route("/owner/project/api/v1/rpc",post(move |body:String|{
+            let records=state.clone();let capable=supported.clone();let server=server.clone();let project=project.clone();let member=member.clone();let key_id=key_id.clone();let public=public.clone();let bundle=server_bundle.clone();let browser_member=browser_member.clone();
+            async move {
+                let proof=parse_and_verify(&body,&public).unwrap();let action=proof.action().unwrap();
+                let identity=json!({"server_id":server,"project_id":project,"encryption_key_id":bundle["key_id"],"role":"approver","capabilities":{"e2ee_approvals":if capable.load(Ordering::SeqCst){vec![1]}else{vec![]}}});
+                let mut rows=records.lock().unwrap();
+                let result=match action.op.as_str() {
+                    "identity"=>identity,
+                    "keys"=>json!({"keys":[{"key_id":key_id,"kind":"ed25519","public_key":public,"member_id":member},{"key_id":"browser-key","kind":"webauthn","public_key":"session-only","member_id":browser_member,"user_id":"browser-user"}]}),
+                    "approval"=>{
+                        let mut value=identity;value["request"]=rows[0].clone();value["decision"]=rows.iter().find(|m|m["approval"]["kind"]=="decision").cloned().unwrap_or(Value::Null);value
+                    },
+                    "approvals"=>{let mut value=identity;value["requests"]=json!([{"request":rows[0],"decision":null}]);value},
+                    "send"=>{
+                        assert_eq!(action.args["payload"]["type"],"e2ee-v1");
+                        let id=rows.len()+42;
+                        rows.push(json!({"id":id,"sender":member,"payload":action.args["payload"],"approval":action.args["approval"],"mentions":action.args["mentions"],"codec":null,"auth":{"scheme":"signed-v1","key_id":key_id,"action_digest":digest(proof.action.get().as_bytes()),"proof_jws":body,"approval_authorized":action.args["approval"]["kind"]=="decision"}}));
+                        json!({"id":id})
+                    },
+                    _=>panic!("unexpected operation {}",action.op),
+                };
+                Json(result)
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/owner/project", listener.local_addr()?);
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut auth = initial.auth.clone();
+        auth.allow_insecure_loopback = true;
+        let c = SignedClient::new(&url, auth, CompatConfig::default())?;
+        *c.room_key.lock().unwrap() = Some(recovery);
+        let http = reqwest::Client::new();
+        let pending = c.call(&http, "approvals", json!({})).await?;
+        assert_eq!(
+            pending["requests"][0]["request"]["auth"]["server_authenticated"],
+            true
+        );
+        assert_eq!(pending["requests"][0]["request"]["auth"]["verified"], false);
+        assert_eq!(
+            pending["requests"][0]["request"]["auth"]["approval_verified"],
+            true
+        );
+        let choice = fixture["request"]["clear"]["options"][0]["id"].clone();
+        assert!(c.call(&http,"send",json!({"payload":{"type":"approval_decision","reply_to":42,"choice_id":choice,"request_digest":format!("sha256:{}","A".repeat(43))}})).await.is_err());
+        c.call(
+            &http,
+            "decide_approval",
+            json!({"request_id":42,"choice_id":choice,"comment":"private client answer"}),
+        )
+        .await?;
+        let detail = c.call(&http, "approval", json!({"request_id":42})).await?;
+        assert_eq!(detail["decision"]["auth"]["approval_target_verified"], true);
+        assert_eq!(detail["decision"]["payload"]["choice_id"], choice);
+        assert!(
+            c.call(
+                &http,
+                "decide_approval",
+                json!({"request_id":42,"choice_id":choice})
+            )
+            .await
+            .is_err()
+        );
+        c.call(
+            &http,
+            "request_approval",
+            json!({"title":"private AI title","options":["approve","decline"]}),
+        )
+        .await?;
+        let saved = records.lock().unwrap().last().unwrap().clone();
+        let clear = crate::key_delivery::tests::browser(
+            json!({"mode":"decrypt","bundle":bundle,"member":c.auth.member_id,"payload":saved["payload"]}),
+        )?;
+        crate::approvals::content(&saved["approval"], &clear)?;
+        assert_eq!(clear["title"], "private AI title");
+        let outbox: Vec<String> = c
+            .outbox()?
+            .prepare("SELECT action FROM signed_outbox")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert!(!outbox.join("").contains("private AI title"));
+        assert!(!outbox.join("").contains("private client answer"));
+        capable.store(false, Ordering::SeqCst);
+        assert!(
+            c.call(
+                &http,
+                "request_approval",
+                json!({"title":"unsupported","options":["yes"]})
+            )
+            .await
+            .is_err()
+        );
+        let mut broken = request.clone();
+        broken["payload"]["ciphertext"] = json!("broken");
+        let value=c.verify_history(&http,json!({"server_id":c.auth.server_id,"project_id":c.auth.project_id,"encryption_key_id":bundle["key_id"],"requests":[{"request":request,"decision":null},{"request":broken,"decision":null}]})).await?;
+        assert_eq!(value["requests"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            value["requests"][1]["request"]["auth"]["approval_verified"],
+            false
+        );
+        assert_eq!(
+            value["requests"][0]["request"]["auth"]["approval_verified"],
+            true
+        );
+        let compact = crate::mcp::model_view(detail);
+        assert!(compact["request"]["auth"].get("receipt").is_none());
+        assert!(compact["decision"].get("encrypted_payload").is_none());
+        assert_eq!(
+            compact["decision"]["auth"]["approval_target_verified"],
+            true
+        );
+        task.abort();
+        Ok(())
+    }
     #[test]
     fn encrypted_legacy_history_decrypts_without_authenticating_its_author() -> Result<()> {
         let fixture: Value = serde_json::from_str(include_str!("../tests/fixtures/e2ee-v1.json"))?;

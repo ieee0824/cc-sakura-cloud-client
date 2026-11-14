@@ -168,3 +168,18 @@ MCPにも `updates` / `message` を公開します。`updates` は `cursor` に�
 `skills/cc-sakura` と `skills/cc-sakura-watch` をAIホストのスキルディレクトリへ配置してください。Codexでは `~/.codex/skills/` へ各フォルダをコピーします。更新時は同じ配布物のSKILL.mdとscriptsを揃えて更新してください。スキルの変更は新しい会話で読み込むか、進行中の会話で明示的に読み直してください。
 
 通常の取得は軽量出力の `updates` / `message`、範囲取得・SSE追従は `history --compact --raw` を既定の手順としています。これはAI向けの利用手順で、既存CLIの通常出力形式は変更しません。
+
+### 暗号化した承認依頼・回答（v0.2.0）
+
+Sakuraサーバーv0.3.0以降で利用できます。MCPの `request_approval` / `decide_approval` / `approvals` / `approval` が作成・回答・未回答一覧・単件照会を提供します。タイトル・説明・選択肢の文言・コメントは暗号化し、選択肢は依頼ごとにランダムなUUIDを使います。
+
+```sh
+cc-sakura --config /absolute/room.toml approval request OWNER/ROOM 'Deploy?' --option Approve --option Decline
+cc-sakura --config /absolute/room.toml approval list OWNER/ROOM
+cc-sakura --config /absolute/room.toml approval show OWNER/ROOM REQUEST_ID
+cc-sakura --config /absolute/room.toml approval decide OWNER/ROOM REQUEST_ID CHOICE_UUID --comment 'Reviewed'
+```
+
+回答には現在のapprover権限が必要です。回答前に対象を取得して署名またはブラウザのセッション記録と暗号文・公開メタデータを照合し、依頼のdigestとchoice IDを確定します。保存済み回答では `auth.approval_verified` と `auth.approval_target_verified` を確認します。ブラウザの `server_authenticated:true` は本人の暗号署名を意味しません。通常履歴の回答単体は対象確認前なので、`approval show` で依頼と一緒に確認してください。
+
+復号・検証エラーの項目は一覧から黙って消しません。最初の回答1件だけを保存し、回答変更や自動コマンド実行は提供しません。曖昧な送信結果では既存operation IDで `auth retry` を使い、別の回答を新規送信しないでください。旧サーバーでは暗号化承認を拒否し、平文へフォールバックしません。通常投稿・履歴・SSEの使い方は維持します。

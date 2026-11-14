@@ -87,7 +87,14 @@ provider = "auto"
     let tools = responses[1]["result"]["tools"].as_array().unwrap();
     assert!(tools.iter().any(|tool| tool["name"] == "retry"));
     assert!(tools.iter().any(|tool| tool["name"] == "send"));
-    for name in ["updates", "message"] {
+    for name in [
+        "updates",
+        "message",
+        "request_approval",
+        "decide_approval",
+        "approvals",
+        "approval",
+    ] {
         let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
         assert!(tool["inputSchema"]["properties"].get("project").is_some());
     }
@@ -119,4 +126,25 @@ fn watch_requires_private_state_and_valid_recovery_options() {
         assert!(!output.status.success());
         assert!(!String::from_utf8_lossy(&output.stderr).contains("read client profile"));
     }
+}
+
+#[test]
+fn approval_cli_rejects_missing_choices_and_malformed_target_before_network() {
+    let bin = env!("CARGO_BIN_EXE_cc-sakura");
+    for args in [
+        vec!["approval", "request", "owner/room", "Deploy?"],
+        vec!["approval", "decide", "owner/room", "wrong", "not-a-uuid"],
+    ] {
+        let result = Command::new(bin).args(args).output().unwrap();
+        assert!(!result.status.success());
+        assert!(!String::from_utf8_lossy(&result.stderr).contains("read client profile"));
+    }
+    assert!(
+        Command::new(bin)
+            .args(["approval", "--help"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
 }
