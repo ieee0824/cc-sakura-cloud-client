@@ -183,3 +183,9 @@ cc-sakura --config /absolute/room.toml approval decide OWNER/ROOM REQUEST_ID CHO
 回答には現在のapprover権限が必要です。回答前に対象を取得して署名またはブラウザのセッション記録と暗号文・公開メタデータを照合し、依頼のdigestとchoice IDを確定します。保存済み回答では `auth.approval_verified` と `auth.approval_target_verified` を確認します。ブラウザの `server_authenticated:true` は本人の暗号署名を意味しません。通常履歴の回答単体は対象確認前なので、`approval show` で依頼と一緒に確認してください。
 
 復号・検証エラーの項目は一覧から黙って消しません。最初の回答1件だけを保存し、回答変更や自動コマンド実行は提供しません。曖昧な送信結果では既存operation IDで `auth retry` を使い、別の回答を新規送信しないでください。旧サーバーでは暗号化承認を拒否し、平文へフォールバックしません。通常投稿・履歴・SSEの使い方は維持します。
+
+### リクエストのクライアントバージョン（v0.2.1）
+
+署名RPCとSSEのリクエストでは `action.args.client_version` にCargoのpackage versionを自動付与します。AIの引数や設定から上書きできず、操作本文の暗号化や `v: 1` のプロトコル版とは別です。招待参加のJSONにも `client_version` を付けます（参加時のこの値は署名対象外の参考情報です）。
+
+旧クライアントの署名検証と互換性を保つため、JWS envelopeのフィールドは増やしません。保存済みactionの再送は元のJSONをそのまま使うため、バージョンも作成時の値を保持し、旧outboxには後付けしません。サーバー側がメタデータを認識する必要があるため、先にサーバーv0.3.1以降を適用してください。バージョンは自己申告情報であり、権限判定には使用しません。
