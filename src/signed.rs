@@ -241,7 +241,7 @@ pub async fn join_agent_token(
         .build()?;
     let mut response = http
         .post(&endpoint)
-        .json(&json!({"token":invitation,"public_key":public,"signature":signature}))
+        .json(&json!({"token":invitation,"public_key":public,"signature":signature,"client_version":env!("CARGO_PKG_VERSION")}))
         .send()
         .await
         .context("room invitation request failed")?;
@@ -703,7 +703,15 @@ impl SignedClient {
         }
         Ok(args.into())
     }
-    fn action(&self, op: &str, args: Value, operation_id: Option<String>) -> Result<Box<RawValue>> {
+    fn action(
+        &self,
+        op: &str,
+        mut args: Value,
+        operation_id: Option<String>,
+    ) -> Result<Box<RawValue>> {
+        args.as_object_mut()
+            .context("arguments must be an object")?
+            .insert("client_version".into(), json!(env!("CARGO_PKG_VERSION")));
         Ok(RawValue::from_string(serde_json::to_string(&Action {
             op: op.into(),
             project_id: self.auth.project_id.clone(),
@@ -1725,6 +1733,7 @@ mod tests {
                 let identity = identity.clone();
                 let invitation = invitation.clone();
                 async move {
+                    assert_eq!(body["client_version"], env!("CARGO_PKG_VERSION"));
                     assert_eq!(body["token"], invitation);
                     assert_eq!(
                         body["public_key"],
@@ -1846,6 +1855,62 @@ mod tests {
                 room_aliases: vec!["old-room".into()],
             },
         )
+    }
+    #[test]
+    fn client_version_is_signed_in_args_without_changing_the_legacy_envelope() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let c = client(dir.path())?;
+        let public = URL_SAFE_NO_PAD.encode(c.key.verifying_key().as_bytes());
+        for op in ["identity", "history", "subscribe", "send"] {
+            let action = c.action(op, json!({"client_version":"caller supplied"}), None)?;
+            let proof = c.sign_action(&action, "/owner/project/api/v1/rpc")?;
+            let verified = parse_and_verify(&proof, &public)?;
+            assert_eq!(
+                verified.action()?.args["client_version"],
+                env!("CARGO_PKG_VERSION")
+            );
+            let parts: Vec<_> = proof.split('.').collect();
+            let mut claims = strict_json(&URL_SAFE_NO_PAD.decode(parts[1])?)?;
+            let mut keys: Vec<_> = claims
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort();
+            assert_eq!(
+                keys,
+                vec![
+                    "action",
+                    "aud",
+                    "endpoint",
+                    "exp",
+                    "iat",
+                    "member_id",
+                    "request_id",
+                    "v"
+                ]
+            );
+            claims["action"]["args"]["client_version"] = json!("99.0.0");
+            let tampered = format!(
+                "{}.{}.{}",
+                parts[0],
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims)?),
+                parts[2]
+            );
+            assert!(parse_and_verify(&tampered, &public).is_err());
+        }
+        // A pending action predating this change must remain byte-for-byte intact.
+        let old = RawValue::from_string(format!(
+            "{{\"op\":\"send\",\"project_id\":\"{}\",\"operation_id\":\"{}\",\"args\":{{\"payload\":{{\"message\":\"old pending\"}}}}}}",
+            c.auth.project_id,
+            Uuid::new_v4()
+        ))?;
+        let verified =
+            parse_and_verify(&c.sign_action(&old, "/owner/project/api/v1/rpc")?, &public)?;
+        assert_eq!(verified.action.get(), old.get());
+        assert!(verified.action()?.args.get("client_version").is_none());
+        Ok(())
     }
     #[test]
     fn signed_request_retains_raw_action_and_binds_every_field() -> Result<()> {
@@ -2032,6 +2097,10 @@ mod tests {
         assert_eq!(client.retry(&http, &operation_id).await?, json!({"id":7}));
         assert_eq!(fixture.count.load(Ordering::SeqCst), 2);
         let requests = fixture.requests.lock().unwrap();
+        assert_eq!(
+            requests[0].action()?.args["client_version"],
+            env!("CARGO_PKG_VERSION")
+        );
         assert_eq!(requests[0].action.get(), requests[1].action.get());
         assert_ne!(requests[0].request_id, requests[1].request_id);
         assert_eq!(requests[0].action()?.operation_id, Some(operation_id));
