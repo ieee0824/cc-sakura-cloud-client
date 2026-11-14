@@ -1,4 +1,6 @@
 //! Encrypted approval metadata. Labels and comments stay inside the ciphertext.
+
+const OTHER_CHOICE: &str = "00000000-0000-4000-8000-000000000000";
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -137,6 +139,9 @@ pub fn content(outer: &Value, body: &Value) -> Result<()> {
                 && body["choice_id"] == outer["choice_id"],
             "approval target or choice mismatch"
         );
+        if outer["choice_id"] == OTHER_CHOICE {
+            text(&body["comment"], 65536, true)?;
+        }
         if let Some(comment) = body.get("comment") {
             text(comment, 65536, false)?;
         }
@@ -184,10 +189,11 @@ pub fn decision(
         "approval request digest mismatch"
     );
     ensure!(
-        request["approval"]["option_ids"]
-            .as_array()
-            .unwrap()
-            .contains(&choice),
+        (choice == OTHER_CHOICE
+            || request["approval"]["option_ids"]
+                .as_array()
+                .unwrap()
+                .contains(&choice)),
         "choice is not in this request"
     );
     let mut body = json!({"type":"approval_decision","reply_to":request["id"],"request_digest":digest,"choice_id":choice,"approval":{"version":1,"kind":"decision","request_id":request["id"],"request_digest":digest,"choice_id":choice}});
@@ -214,10 +220,11 @@ pub fn bind_decision(request: &Value, decision: &Value) -> Result<()> {
             && decision["approval"]["kind"] == "decision"
             && decision["approval"]["request_id"] == request["id"]
             && decision["approval"]["request_digest"] == request["auth"]["action_digest"]
-            && request["approval"]["option_ids"]
-                .as_array()
-                .unwrap()
-                .contains(&decision["approval"]["choice_id"]),
+            && (decision["approval"]["choice_id"] == OTHER_CHOICE
+                || request["approval"]["option_ids"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&decision["approval"]["choice_id"])),
         "decision does not match request"
     );
     Ok(())
@@ -254,6 +261,19 @@ mod tests {
         }
         let mut request = json!({"id":42,"approval":fixture["request"]["approval"],"payload":fixture["request"]["clear"],"auth":{"server_authenticated":true,"approval_verified":true,"action_digest":fixture["request"]["action_digest"]}});
         let choice = fixture["decision"]["clear"]["choice_id"].clone();
+        assert!(decision(&request, json!(OTHER_CHOICE), None, None).is_err());
+        assert!(decision(&request, json!(OTHER_CHOICE), Some(json!(" ")), None).is_err());
+        let other = decision(
+            &request,
+            json!(OTHER_CHOICE),
+            Some(json!("Check staging first")),
+            None,
+        )?;
+        let other_answer = json!({"approval":other["approval"],"payload":other,"auth":{"verified":true,"approval_verified":true,"approval_authorized":true}});
+        bind_decision(&request, &other_answer)?;
+        let mut wrong = other_answer.clone();
+        wrong["approval"]["request_digest"] = json!("wrong");
+        assert!(bind_decision(&request, &wrong).is_err());
         let body = decision(&request, choice.clone(), None, None)?;
         let mut answer = json!({"approval":body["approval"],"payload":body,"auth":{"verified":true,"approval_verified":true,"approval_authorized":true}});
         bind_decision(&request, &answer)?;
