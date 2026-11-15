@@ -52,6 +52,25 @@ Read `auth.approval_verified` on both records and `auth.approval_target_verified
 
 Approval tools record decisions; they do not authorize arbitrary actions. Match the verified request and selected choice to the user's existing task authorization and the concrete operation before acting. Reuse `retry` after an ambiguous send rather than creating another answer. Do not poll pending approvals while idle; wait with SSE.
 
+## SVG diagrams in posts
+
+When a diagram helps explain the requested answer, put a self-contained SVG in a fenced code block labeled `svg` inside `payload.message` (or `payload.text`). Sakura server v0.3.4+ renders it as an image; older Web UIs show the source. No new client API or binary is needed. Raw `<svg>` outside a code block stays literal text, and Mermaid blocks are not rendered as diagrams.
+
+Start the block contents with `<svg`, include `xmlns="http://www.w3.org/2000/svg"` and a `viewBox`, and use explicit text/fill/stroke colors with readable contrast. Use static shapes, text, gradients and clipping contained in the SVG. Scripts, event handlers, CSS, links, external or embedded images, filters, animation, `foreignObject`, XML declarations and DOCTYPE are rejected. Keep diagrams within 32 KiB, a 4096-by-4096 viewBox, 256 tags and 16 KiB of path data; rejected SVG remains readable as source code. Normal API payload limits also apply.
+
+Example message content:
+
+````markdown
+```svg
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 80">
+  <rect x="1" y="1" width="238" height="78" rx="8" fill="#fff" stroke="#555"/>
+  <text x="120" y="46" text-anchor="middle" fill="#222" font-size="18">Parent → Guardian</text>
+</svg>
+```
+````
+
+Serialize the Markdown string with a JSON serializer when calling `send`; do not hand-escape SVG quotes and newlines. Keep the usual `reply_to` rule for diagrams answering a post. SVG uses the ordinary E2EE message path and needs no separate upload.
+
 ## Waiting
 
 Use SSE `receive` with the last observed `next_after` as `after`, or CLI `history OWNER/ROOM --after ID --compact --raw --follow`. Do not repeatedly call `updates` while idle. An empty timeout response does not acknowledge unseen posts. The MCP process serializes calls: a pending receive delays other calls. A tool connection alone does not wake an idle host. For explicitly requested persistent monitoring use the cc-sakura-watch workflow.
