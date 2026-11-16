@@ -22,6 +22,34 @@ use std::{
 };
 use uuid::Uuid;
 
+#[derive(Debug)]
+pub struct StreamFailure {
+    pub status: u16,
+    pub retry_after: u64,
+}
+impl std::fmt::Display for StreamFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "stream HTTP status {}", self.status)
+    }
+}
+impl std::error::Error for StreamFailure {}
+fn stream_response(response: reqwest::Response) -> Result<reqwest::Response> {
+    if !response.status().is_success() {
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+            .min(86400);
+        return Err(StreamFailure {
+            status: response.status().as_u16(),
+            retry_after,
+        }
+        .into());
+    }
+    Ok(response)
+}
 const TYPE: &str = "cc-sakura-request-v1+jws";
 const MAX_COMPACT: usize = 2 * 1024 * 1024;
 const MAX_PAYLOAD: usize = 1024 * 1024;
@@ -802,9 +830,11 @@ impl SignedClient {
     }
     async fn response(response: reqwest::Response) -> Result<Value> {
         let status = response.status();
-        if status.is_server_error() {
-            response.error_for_status_ref()?;
-        }
+        let response = if status.is_server_error() || status.as_u16() == 429 {
+            stream_response(response)?
+        } else {
+            response
+        };
         let mut response = response;
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await? {
@@ -1402,6 +1432,98 @@ impl SignedClient {
         })?;
         Ok(result)
     }
+    pub async fn stream_capable(&self, http: &reqwest::Client) -> Result<bool> {
+        let identity = self
+            .send_action(http, &self.action("identity", json!({}), None)?)
+            .await?;
+        Ok(identity["capabilities"]["stream_auth"]
+            .as_array()
+            .is_some_and(|v| v.contains(&json!(1))))
+    }
+    pub async fn open_stream(&self, http: &reqwest::Client) -> Result<(reqwest::Response, String)> {
+        let mut random = [0u8; 32];
+        getrandom::getrandom(&mut random)
+            .map_err(|_| anyhow::anyhow!("random source unavailable"))?;
+        let nonce = URL_SAFE_NO_PAD.encode(random);
+        let response = http
+            .get(format!("{}/api/v2/events", self.project_url))
+            .query(&[("project_id", &self.auth.project_id)])
+            .header("accept", "text/event-stream")
+            .header("sakura-stream-client-nonce", &nonce)
+            .send()
+            .await?;
+        let response = stream_response(response)?;
+        ensure!(
+            response
+                .headers()
+                .get("content-type")
+                .is_some_and(|v| v.to_str().unwrap_or("").starts_with("text/event-stream")),
+            "invalid stream content type"
+        );
+        Ok((response, nonce))
+    }
+    // Only the stream state machine calls this with a challenge read from its
+    // currently open, TLS-verified response. Never expose this as an MCP tool.
+    pub async fn authenticate_stream(
+        &self,
+        http: &reqwest::Client,
+        challenge: &Value,
+        nonce: &str,
+        args: &Value,
+    ) -> Result<()> {
+        ensure!(
+            challenge["version"] == 1
+                && challenge["project_id"] == self.auth.project_id
+                && challenge["client_nonce"] == nonce,
+            "stream challenge mismatch"
+        );
+        for field in ["connection_id", "challenge"] {
+            let value = challenge[field]
+                .as_str()
+                .context("missing stream challenge")?;
+            ensure!(
+                URL_SAFE_NO_PAD.decode(value)?.len() == 32,
+                "invalid stream challenge"
+            );
+        }
+        let time = now()?;
+        ensure!(
+            challenge["expires_at"]
+                .as_i64()
+                .is_some_and(|v| v > time && v <= time + 60),
+            "expired stream challenge"
+        );
+        let url = url::Url::parse(&format!("{}/api/v2/events/auth", self.project_url))?;
+        let base = url::Url::parse(&self.project_url)?;
+        let args = self.target(args)?;
+        let mut subscription = json!({"after": args["after"].as_u64().unwrap_or(0), "limit": args["limit"].as_u64().unwrap_or(1000), "include_human": args["include_human"].as_bool().unwrap_or(true)});
+        if let Some(v) = args.get("mentions") {
+            subscription["mentions"] = v.clone();
+        }
+        let payload = json!({"v":1,"aud":self.auth.server_id,"origin":base.origin().ascii_serialization(),"method":"POST",
+            "endpoint":url.path(),"stream_endpoint":format!("{}/api/v2/events",base.path().trim_end_matches('/')),
+            "project_id":self.auth.project_id,"member_id":self.auth.member_id,"connection_id":challenge["connection_id"],
+            "challenge":challenge["challenge"],"client_nonce":nonce,"iat":time,"exp":time+30,"subscription":subscription,"client_version":env!("CARGO_PKG_VERSION")});
+        let header = json!({"alg":"Ed25519","kid":key_id(self.key.verifying_key().as_bytes()),"typ":"cc-sakura-stream-auth-v1+jws"});
+        let input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header)?),
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload)?)
+        );
+        let body = format!(
+            "{}.{}",
+            input,
+            URL_SAFE_NO_PAD.encode(self.key.sign(input.as_bytes()).to_bytes())
+        );
+        stream_response(
+            http.post(url)
+                .header("content-type", "application/jose")
+                .body(body)
+                .send()
+                .await?,
+        )?;
+        Ok(())
+    }
     pub async fn events(&self, http: &reqwest::Client, args: &Value) -> Result<reqwest::Response> {
         crate::timing::measure("sse.open", "subscribe", self.events_inner(http, args)).await
     }
@@ -1855,6 +1977,82 @@ mod tests {
                 room_aliases: vec!["old-room".into()],
             },
         )
+    }
+    #[tokio::test]
+    async fn stream_auth_binds_the_original_connection_and_rejects_foreign_challenges() -> Result<()>
+    {
+        use axum::{Router, routing::post};
+        let dir = tempfile::tempdir()?;
+        let initial = client(dir.path())?;
+        let captured = Arc::new(std::sync::Mutex::new(String::new()));
+        let output = captured.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let router = Router::new().route(
+            "/owner/project/api/v2/events/auth",
+            post(move |body: String| {
+                let output = output.clone();
+                async move {
+                    *output.lock().unwrap() = body;
+                    "{}"
+                }
+            }),
+        );
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let mut auth = initial.auth.clone();
+        auth.allow_insecure_loopback = true;
+        let client = SignedClient::new(
+            &format!("http://{address}/owner/project"),
+            auth,
+            CompatConfig::default(),
+        )?;
+        let nonce = URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let challenge = json!({"version":1,"project_id":client.auth.project_id,"client_nonce":nonce,
+            "connection_id":URL_SAFE_NO_PAD.encode([8u8;32]),"challenge":URL_SAFE_NO_PAD.encode([9u8;32]),"expires_at":now()?+30});
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        client
+            .authenticate_stream(
+                &http,
+                &challenge,
+                &nonce,
+                &json!({"after":17,"include_human":false}),
+            )
+            .await?;
+        let raw = captured.lock().unwrap().clone();
+        let parts: Vec<_> = raw.split('.').collect();
+        let header: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0])?)?;
+        let body: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1])?)?;
+        assert_eq!(header["typ"], "cc-sakura-stream-auth-v1+jws");
+        assert_eq!(body["connection_id"], challenge["connection_id"]);
+        assert_eq!(body["client_nonce"], nonce);
+        assert_eq!(body["subscription"]["after"], 17);
+        assert_eq!(body["endpoint"], "/owner/project/api/v2/events/auth");
+        client.key.verifying_key().verify_strict(
+            format!("{}.{}", parts[0], parts[1]).as_bytes(),
+            &Signature::from_slice(&URL_SAFE_NO_PAD.decode(parts[2])?)?,
+        )?;
+        let mut foreign = challenge.clone();
+        foreign["client_nonce"] = json!("wrong");
+        assert!(
+            client
+                .authenticate_stream(&http, &foreign, &nonce, &json!({}))
+                .await
+                .is_err()
+        );
+        foreign = challenge;
+        foreign["expires_at"] = json!(now()? - 1);
+        assert!(
+            client
+                .authenticate_stream(&http, &foreign, &nonce, &json!({}))
+                .await
+                .is_err()
+        );
+        task.abort();
+        Ok(())
     }
     #[test]
     fn client_version_is_signed_in_args_without_changing_the_legacy_envelope() -> Result<()> {

@@ -403,7 +403,8 @@ pub async fn run(client: &Client, options: Options) -> Result<()> {
             Ok(None) => bail!("signed SSE required"),
             Err(e) if transient(&e) || e.to_string() == "event connection timed out" => {
                 eprintln!("watch reconnect");
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                client.note_stream_error(&e).await;
+                client.reconnect_wait().await;
                 continue;
             }
             Err(e) => return Err(e),
@@ -420,11 +421,15 @@ pub async fn run(client: &Client, options: Options) -> Result<()> {
                     }
                 }
                 Ok(None) => break,
-                Err(e) if transient(&e) || e.to_string() == "event heartbeat timed out" => break,
+                Err(e) if transient(&e) || e.to_string() == "event heartbeat timed out" => {
+                    client.note_stream_error(&e).await;
+                    break;
+                }
                 Err(e) => return Err(e),
             }
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        client.stable_connection(stream.stable()).await;
+        client.reconnect_wait().await;
     }
 }
 

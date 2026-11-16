@@ -291,14 +291,14 @@ async fn main() -> Result<()> {
                         match client.events(&args).await {
                             Ok(Some(events))=>stream=Some(events),
                             Ok(None)=>bail!("signed event stream required"),
-                            Err(error) if transient(&error)||error.to_string()=="event connection timed out"=>{eprintln!("event reconnect");tokio::time::sleep(std::time::Duration::from_secs(1)).await;continue;}
+                            Err(error) if transient(&error)||error.to_string()=="event connection timed out"=>{eprintln!("event reconnect");client.note_stream_error(&error).await;client.reconnect_wait().await;continue;}
                             Err(error)=>return Err(error),
                         }
                     }
                     match stream.as_mut().unwrap().next().await {
                         Ok(Some(value))=>value,
-                        Ok(None)=>{stream=None;tokio::time::sleep(std::time::Duration::from_secs(1)).await;continue;}
-                        Err(error) if transient(&error)||error.to_string()=="event heartbeat timed out"=>{stream=None;tokio::time::sleep(std::time::Duration::from_secs(1)).await;continue;}
+                        Ok(None)=>{client.stable_connection(stream.as_ref().is_some_and(Events::stable)).await;stream=None;client.reconnect_wait().await;continue;}
+                        Err(error) if transient(&error)||error.to_string()=="event heartbeat timed out"=>{client.note_stream_error(&error).await;stream=None;client.reconnect_wait().await;continue;}
                         Err(error)=>return Err(error),
                     }
                 }else{client.call("history",args).await?};
@@ -329,15 +329,38 @@ mod config_tests {
 
 #[derive(Clone)]
 pub struct Client {
+    receivers: std::sync::Arc<
+        tokio::sync::Mutex<
+            std::collections::BTreeMap<String, std::sync::Arc<tokio::sync::Mutex<Receiver>>>,
+        >,
+    >,
+    reconnect: std::sync::Arc<tokio::sync::Mutex<Reconnect>>,
     http: reqwest::Client,
     signed: Option<std::sync::Arc<signed::SignedClient>>,
 }
+#[derive(Default)]
+struct Receiver {
+    stream: Option<Events>,
+    after: u64,
+    last: Option<Value>,
+}
+#[derive(Default)]
+struct Reconnect {
+    failures: u32,
+    not_before: Option<tokio::time::Instant>,
+}
 pub struct Events {
+    opened: std::time::Instant,
     response: reqwest::Response,
     buffer: Vec<u8>,
+    handshake: Option<(String, Value, u8, Option<String>)>,
     verifier: Option<(std::sync::Arc<signed::SignedClient>, reqwest::Client)>,
 }
 impl Events {
+    fn stable(&self) -> bool {
+        self.opened.elapsed() >= std::time::Duration::from_secs(60)
+    }
+
     async fn next(&mut self) -> Result<Option<Value>> {
         timing::measure("sse.wait_and_verify", "subscribe", self.next_inner()).await
     }
@@ -363,7 +386,43 @@ impl Events {
                     .collect::<Vec<_>>()
                     .join("\n");
                 if !data.is_empty() {
-                    let value = serde_json::from_str(&data)?;
+                    let value: Value = serde_json::from_str(&data)?;
+                    if let Some((nonce, args, phase, connection)) = &mut self.handshake {
+                        let event = text
+                            .lines()
+                            .find_map(|l| l.strip_prefix("event:").map(str::trim))
+                            .unwrap_or("");
+                        match event {
+                            "challenge" if *phase == 0 => {
+                                let (client, http) =
+                                    self.verifier.as_ref().context("missing stream verifier")?;
+                                client
+                                    .authenticate_stream(http, &value, nonce, args)
+                                    .await?;
+                                *connection = value["connection_id"].as_str().map(str::to_owned);
+                                *phase = 1;
+                                continue;
+                            }
+                            "ready" if *phase == 1 => {
+                                anyhow::ensure!(
+                                    value["connection_id"].as_str() == connection.as_deref(),
+                                    "stream connection mismatch"
+                                );
+                                *phase = 2;
+                                continue;
+                            }
+                            "messages" if *phase == 2 => {}
+                            "error" => {
+                                return Err(signed::StreamFailure {
+                                    status: value["status"].as_u64().unwrap_or(503) as u16,
+                                    retry_after: value["retry_after"].as_u64().unwrap_or(0),
+                                }
+                                .into());
+                            }
+                            _ => bail!("unexpected stream event during authentication"),
+                        }
+                    }
+
                     let value = if let Some((client, http)) = &self.verifier {
                         client.verify_history(http, value).await?
                     } else {
@@ -394,16 +453,54 @@ impl Events {
     }
 }
 fn transient(error: &anyhow::Error) -> bool {
+    if let Some(e) = error.downcast_ref::<signed::StreamFailure>() {
+        return e.status == 429 || e.status >= 500;
+    }
     error.downcast_ref::<reqwest::Error>().is_some_and(|e| {
         if let Some(status) = e.status() {
-            return status.is_server_error();
+            return status.is_server_error() || status.as_u16() == 429;
         }
         e.is_connect() || e.is_request() || e.is_timeout() || e.is_body()
     })
 }
 impl Client {
+    async fn note_stream_error(&self, error: &anyhow::Error) {
+        if let Some(e) = error.downcast_ref::<signed::StreamFailure>() {
+            let until = tokio::time::Instant::now()
+                + std::time::Duration::from_secs(e.retry_after.min(86400));
+            let mut state = self.reconnect.lock().await;
+            state.not_before = Some(state.not_before.map_or(until, |old| old.max(until)));
+        }
+    }
+    async fn reconnect_wait(&self) {
+        let until = {
+            let mut state = self.reconnect.lock().await;
+            let seconds = (1u64 << state.failures.min(6)).min(60);
+            state.failures = state.failures.saturating_add(1);
+            let mut random = [0u8; 2];
+            let _ = getrandom::getrandom(&mut random);
+            let jitter = u16::from_le_bytes(random) as u64 % (seconds * 250 + 1);
+            let until = tokio::time::Instant::now()
+                + std::time::Duration::from_millis(seconds * 1000 + jitter);
+            let until = state.not_before.map_or(until, |old| old.max(until));
+            state.not_before = Some(until);
+            until
+        };
+        tokio::time::sleep_until(until).await;
+    }
+    async fn stable_connection(&self, stable: bool) {
+        if stable {
+            self.reconnect.lock().await.failures = 0;
+        }
+    }
+
     // A dedicated client has no whole-response timeout: SSE is intentionally long-lived.
     async fn events(&self, args: &Value) -> Result<Option<Events>> {
+        let until = self.reconnect.lock().await.not_before;
+        if let Some(until) = until {
+            tokio::time::sleep_until(until).await;
+        }
+
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
@@ -412,44 +509,136 @@ impl Client {
             .signed
             .as_ref()
             .context("signed authentication required")?;
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            signed.events(&http, args),
-        )
-        .await
-        .context("event connection timed out")??;
+        let capable = signed.stream_capable(&self.http).await?;
+        let (response, handshake) = if capable {
+            let (response, nonce) = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                signed.open_stream(&http),
+            )
+            .await
+            .context("event connection timed out")??;
+            (response, Some((nonce, args.clone(), 0, None)))
+        } else {
+            (
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    signed.events(&http, args),
+                )
+                .await
+                .context("event connection timed out")??,
+                None,
+            )
+        };
         Ok(Some(Events {
+            opened: std::time::Instant::now(),
             response,
+            handshake,
             buffer: Vec::new(),
             verifier: Some((signed.clone(), self.http.clone())),
         }))
     }
 
     async fn receive(&self, mut args: Value) -> Result<Value> {
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_secs(
-                args["timeout_seconds"].as_u64().unwrap_or(300).min(300),
-            );
-        let mut delay = 1;
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            args["timeout_seconds"] = json!(remaining.as_secs().max(1));
-            match self.call("receive", args.clone()).await {
-                Ok(value) => return Ok(value),
-                Err(error) => {
-                    if !transient(&error) || tokio::time::Instant::now() >= deadline {
-                        return Err(error);
-                    }
-                    eprintln!("receive reconnect: {error}");
-                    tokio::time::sleep_until(
-                        (tokio::time::Instant::now() + std::time::Duration::from_secs(delay))
-                            .min(deadline),
-                    )
-                    .await;
-                    delay = (delay * 2).min(10);
+        let seconds = args["timeout_seconds"]
+            .as_u64()
+            .unwrap_or(300)
+            .clamp(1, 300);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(seconds);
+        args.as_object_mut()
+            .context("invalid receive arguments")?
+            .remove("timeout_seconds");
+        let requested = args["after"].as_u64().unwrap_or(0);
+        let mut key_args = args.clone();
+        key_args.as_object_mut().unwrap().remove("after");
+        let key = serde_json::to_string(&key_args)?;
+        let slot = {
+            let mut slots = self.receivers.lock().await;
+            if !slots.contains_key(&key) && slots.len() >= 4 {
+                bail!("too many receive subscriptions");
+            }
+            slots.entry(key).or_default().clone()
+        };
+        let mut receiver = tokio::time::timeout_at(deadline, slot.lock())
+            .await
+            .context("receive already waiting")?;
+        if requested < receiver.after {
+            if let Some(last) = &receiver.last {
+                let first = last["messages"]
+                    .as_array()
+                    .and_then(|m| m.first())
+                    .and_then(|m| m["id"].as_u64())
+                    .unwrap_or(u64::MAX);
+                if requested >= first.saturating_sub(1) {
+                    let mut page = last.clone();
+                    page["messages"]
+                        .as_array_mut()
+                        .unwrap()
+                        .retain(|m| m["id"].as_u64().is_some_and(|id| id > requested));
+                    return Ok(page);
                 }
             }
+            return self.call("history", args).await;
         }
+        if requested > receiver.after {
+            receiver.stream = None;
+            receiver.after = requested;
+        }
+        loop {
+            if receiver.stream.is_none() {
+                args["after"] = json!(receiver.after);
+                match tokio::time::timeout_at(deadline, self.events(&args)).await {
+                    Ok(Ok(stream)) => receiver.stream = stream,
+                    Ok(Err(e))
+                        if transient(&e) || e.to_string() == "event connection timed out" =>
+                    {
+                        self.note_stream_error(&e).await;
+                        let _ = tokio::time::timeout_at(deadline, self.reconnect_wait()).await;
+                    }
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => break,
+                }
+            }
+            if let Some(stream) = receiver.stream.as_mut() {
+                match tokio::time::timeout_at(deadline, stream.next()).await {
+                    Ok(Ok(Some(page))) => {
+                        receiver.after = page["messages"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|m| m["id"].as_u64())
+                            .max()
+                            .unwrap_or(receiver.after);
+                        receiver.last = Some(page.clone());
+                        return Ok(page);
+                    }
+                    Err(_) => {
+                        if stream.handshake.as_ref().is_some_and(|h| h.2 < 2) {
+                            receiver.stream = None;
+                        }
+                        break;
+                    }
+                    Ok(Err(e))
+                        if !transient(&e) && e.to_string() != "event heartbeat timed out" =>
+                    {
+                        receiver.stream = None;
+                        return Err(e);
+                    }
+                    other => {
+                        if let Ok(Err(e)) = &other {
+                            self.note_stream_error(e).await;
+                        }
+                        self.stable_connection(stream.stable()).await;
+                        receiver.stream = None;
+                        let _ = tokio::time::timeout_at(deadline, self.reconnect_wait()).await;
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+        args["after"] = json!(requested);
+        self.call("history", args).await
     }
     async fn retry(&self, operation_id: &str) -> Result<Value> {
         self.signed
@@ -501,6 +690,8 @@ fn client_from_config(
         http = http.redirect(reqwest::redirect::Policy::none());
     }
     Ok(Client {
+        receivers: Default::default(),
+        reconnect: Default::default(),
         http: http.build()?,
         signed,
     })
@@ -552,5 +743,129 @@ mod cli_tests {
             ])
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::*;
+    #[tokio::test]
+    async fn retry_after_survives_a_cancelled_wait_and_client_clone() {
+        let client = Client {
+            http: reqwest::Client::new(),
+            signed: None,
+            reconnect: Default::default(),
+            receivers: Default::default(),
+        };
+        client
+            .note_stream_error(
+                &signed::StreamFailure {
+                    status: 429,
+                    retry_after: 120,
+                }
+                .into(),
+            )
+            .await;
+        let until = client.reconnect.lock().await.not_before.unwrap();
+        let clone = client.clone();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), clone.reconnect_wait())
+                .await
+                .is_err()
+        );
+        assert!(client.reconnect.lock().await.not_before.unwrap() >= until);
+        assert!(until > tokio::time::Instant::now() + std::time::Duration::from_secs(119));
+        assert!(transient(
+            &signed::StreamFailure {
+                status: 503,
+                retry_after: 0
+            }
+            .into()
+        ));
+        assert!(!transient(
+            &signed::StreamFailure {
+                status: 403,
+                retry_after: 0
+            }
+            .into()
+        ));
+    }
+}
+
+#[cfg(test)]
+mod stream_receiver_tests {
+    use super::*;
+    async fn response(text: &'static str) -> (reqwest::Response, tokio::task::JoinHandle<()>) {
+        use axum::{Router, routing::get};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/events", get(move || async move { text }));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let response = reqwest::get(format!("http://{address}/events"))
+            .await
+            .unwrap();
+        (response, task)
+    }
+    #[tokio::test]
+    async fn receive_reuses_stream_and_replays_cached_page_by_cursor() {
+        let (response,task)=response("event: messages\ndata: {\"messages\":[{\"id\":1}]}\n\nevent: messages\ndata: {\"messages\":[{\"id\":2}]}\n\n").await;
+        let stream = Events {
+            response,
+            opened: std::time::Instant::now(),
+            buffer: vec![],
+            handshake: None,
+            verifier: None,
+        };
+        let client = Client {
+            http: reqwest::Client::new(),
+            signed: None,
+            reconnect: Default::default(),
+            receivers: Default::default(),
+        };
+        let args = json!({"after":0,"timeout_seconds":2});
+        client.receivers.lock().await.insert(
+            "{}".into(),
+            std::sync::Arc::new(tokio::sync::Mutex::new(Receiver {
+                stream: Some(stream),
+                after: 0,
+                last: None,
+            })),
+        );
+        assert_eq!(
+            client.receive(args.clone()).await.unwrap()["messages"][0]["id"],
+            1
+        );
+        assert_eq!(client.receive(args).await.unwrap()["messages"][0]["id"], 1);
+        assert_eq!(
+            client
+                .receive(json!({"after":1,"timeout_seconds":2}))
+                .await
+                .unwrap()["messages"][0]["id"],
+            2
+        );
+        assert_eq!(client.receivers.lock().await.len(), 1);
+        task.abort();
+    }
+    #[tokio::test]
+    async fn rejects_messages_before_authentication_and_classifies_sse_errors() {
+        let (response, task) = response("event: messages\ndata: {\"messages\":[]}\n\n").await;
+        let mut events = Events {
+            response,
+            opened: std::time::Instant::now(),
+            buffer: vec![],
+            handshake: Some(("nonce".into(), json!({}), 0, None)),
+            verifier: None,
+        };
+        assert!(
+            events
+                .next()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected stream event")
+        );
+        task.abort();
     }
 }
