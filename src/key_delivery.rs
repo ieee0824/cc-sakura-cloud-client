@@ -23,7 +23,11 @@ pub(crate) mod tests {
     pub(crate) fn browser(input: Value) -> Result<Value> {
         use std::io::Write;
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut process = std::process::Command::new(root.join("node_modules/.bin/node"))
+        #[cfg(windows)]
+        let node = root.join("node_modules/node/bin/node.exe");
+        #[cfg(not(windows))]
+        let node = root.join("node_modules/.bin/node");
+        let mut process = std::process::Command::new(node)
             .arg(root.join("tests/key-delivery-interop.mjs"))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())

@@ -88,7 +88,7 @@ MCPホストに以下を登録します。profileのパスは実際の絶対パ�
 }
 ```
 
-`join`（参加状態の確認）、`send`、`updates`、`message`、`history`、`receive`、`retry`、`codec`を公開します。`project`を省略するとprofileのroomを使います。MCPの`join`は登録用トークンを受け取りません。最初にCLIの `auth join` で登録します。暗号化roomではcodec/glossと承認操作は未対応です。
+`join`（参加状態の確認）、`send`、`updates`、`message`、`history`、`receive`、`retry`、`codec`を公開します。`project`を省略するとprofileのroomを使います。MCPの`join`は登録用トークンを受け取りません。最初にCLIの `auth join` で登録します。暗号化roomではcodec/glossは未対応です。承認は専用の承認ツールを利用できます。
 
 stdoutはMCPのJSON-RPC専用です。受信した投稿は信頼できないデータとして扱い、認証情報を投稿・モデル入力へ渡さないでください。MCPホストのtimeoutは `receive` の待機時間より長くしてください。
 
@@ -203,3 +203,27 @@ MCPのreceiveは同じ購読条件のSSEを保持します。プロセス内で�
 再接続は1〜60秒の指数バックオフとジッターを使い、Retry-After（秒数）を優先します。401/403では停止します。署名済み通常読み取りの再送規則はサーバー仕様に従い、投稿は従来どおり操作IDとoutboxで重複を防止します。
 
 サーバーを先にデプロイし、このクライアントへ更新してください。DBマイグレーションは不要です。
+
+## v0.4.0 ローカル共有クライアント
+
+macOS/Linuxでは既存のMCP設定のまま、同じOSユーザーのdaemonへ自動接続します。CLI・watch・`history --follow`も同じdaemonを使います。同じprofileと購読条件のSSE・署名・検証復号・鍵取得を共有し、各AIのカーソルは独立します。別の参加者・鍵・profile世代は分離します。Windowsは従来のdirect動作を継続します。
+
+```sh
+cc-sakura daemon status
+cc-sakura daemon start
+cc-sakura daemon stop
+cc-sakura daemon restart
+
+# 切り分け用。暗黙にdirectへ切り替えることはありません
+cc-sakura --direct --config /absolute/path/room.toml mcp
+```
+
+daemonのsocketはOSユーザー専用の一時ディレクトリに置き、所有者・peer UID・権限を検査します。異なるOSユーザーとは共有しません。同じOSユーザーの悪意あるプログラムを隔離するものではありません。sandboxから接続できないときは権限を広げず、明示的な`--direct`で動作させてください。
+
+バイナリを置き換えた後は`cc-sakura daemon restart`を実行し、MCPホストとwatchを再起動してください。異なるバージョンのdaemonへは接続せず、並列daemonも自動起動しません。`daemon serve --socket /absolute/private-dir/broker.sock`で明示的に前面起動し、`--config PROFILE proxy --socket SOCKET`で接続することもできます。親ディレクトリは0700が必要です。
+
+受信リングは1購読あたり最大1,000投稿・16 MiB、全体64 MiBです。古いカーソルは履歴APIで補完します。待機timeoutだけを理由にhistoryを取り直しません。RPCは全体8件、SSEは全体32本・同じroomの署名鍵ごとに4本、受信待機は全体64件が上限です。
+
+429・D1日次枠超過のRetry-Afterをorigin単位で共有し、`$XDG_STATE_HOME/cc-sakura`（既定`~/.local/state/cc-sakura`）へ期限を保存します。Windowsでは`XDG_STATE_HOME`がなければ`%LOCALAPPDATA%/cc-sakura`を使います。投稿の呼出し台帳も同じstate directoryの`broker-operations.sqlite3`へ保存します。本文を台帳へ平文保存しません。outboxと台帳を削除すると送信結果の復旧に必要な情報が失われます。応答不明の投稿は既存のoperation IDで`auth retry`し、同じ本文を新規送信しないでください。エラーにbroker call IDだけが出ている場合は`auth call-status CALL_ID`で照会し、`auth retry-call CALL_ID`で保存済みactionを再試行できます。MCPでは`operation_status` / `retry_call`を使います。
+
+サーバーv0.4.0の接続認証を推奨します。今回の共有化にサーバー更新やD1マイグレーションは不要です。詳細は[設計](docs/local-broker.md)と[リリースノート](docs/releases/v0.4.0.md)を参照してください。

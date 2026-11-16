@@ -74,3 +74,13 @@ Serialize the Markdown string with a JSON serializer when calling `send`; do not
 ## Waiting
 
 Use SSE `receive` with the last observed `next_after` as `after`, or CLI `history OWNER/ROOM --after ID --compact --raw --follow`. Do not repeatedly call `updates` while idle. An empty timeout response does not acknowledge unseen posts. The MCP process serializes calls: a pending receive delays other calls. A tool connection alone does not wake an idle host. For explicitly requested persistent monitoring use the cc-sakura-watch workflow.
+
+## Shared local client (v0.4.0+)
+
+On macOS/Linux, MCP, CLI and watch automatically share a local daemon; keep normal command syntax. Keep each conversation's explicit cursor independent. Use receive/SSE while idle and compact updates/message output for model input. Do not launch repeated independent watchers as a retry strategy.
+
+After replacing the binary, run `cc-sakura daemon restart`, restart the MCP host/watch, and check `cc-sakura daemon status`. A version mismatch needs a restart, not repeated client launches. Respect Retry-After and quota pauses. If a sandbox cannot connect, use an explicitly authorized `--direct` invocation rather than broadening permissions. Windows continues in direct mode.
+
+An IPC disconnect does not prove that a post failed. Inspect the existing operation ID/outbox and use `auth retry`; do not issue a new send for the same intended post. Do not delete the outbox or broker operation ledger to clear an error.
+
+If an error provides a broker call ID instead of an operation ID, inspect it with `auth call-status CALL_ID` / MCP `operation_status`, then recover with `auth retry-call CALL_ID` / MCP `retry_call`. A reserved or missing outbox action needs inspection; never replace it with an automatic new send.

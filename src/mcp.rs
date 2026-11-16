@@ -1,7 +1,7 @@
 use crate::Client;
 use anyhow::Result;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 
 fn definitions(signed: bool) -> Value {
     let room = json!({"type":"string","minLength":1});
@@ -100,6 +100,18 @@ fn definitions(signed: bool) -> Value {
             properties["room"] = json!({"type":"string","description":"Configured owner/project or explicit compatibility alias."});
             tools.push(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}}));
         }
+        for (name, description) in [
+            (
+                "operation_status",
+                "Inspect a broker call ID from an uncertain posting error; returns its saved operation ID and state.",
+            ),
+            (
+                "retry_call",
+                "Recover an uncertain broker call using its saved operation ID and exact outbox action. Never creates a new post.",
+            ),
+        ] {
+            tools.push(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":{"call_id":{"type":"string","format":"uuid"}},"required":["call_id"],"additionalProperties":false}}));
+        }
         tools.push(json!({"name":"retry","description":"Recover a previously saved signed update by operation ID. Reuses the exact action; do not create another send after an ambiguous network failure.","inputSchema":{"type":"object","properties":{"operation_id":{"type":"string","format":"uuid"}},"required":["operation_id"],"additionalProperties":false}}));
     }
     json!({"tools":tools})
@@ -164,11 +176,45 @@ pub(crate) fn compact_message(message: &mut Value) {
 
 /// MCP stdio, protocol revision 2025-11-25. Stdout is JSON-RPC only.
 pub async fn run(client: Client) -> Result<()> {
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut stdout = tokio::io::stdout();
+    run_io(client, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+pub async fn run_io<R, W>(client: Client, input: R, stdout: W) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    run_session(client, input, stdout, false).await
+}
+
+pub(crate) async fn run_session<R, W>(
+    client: Client,
+    input: R,
+    mut stdout: W,
+    internal: bool,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut lines = crate::framing::Frames::new(input);
     let mut initialized = false;
     let mut ready = false;
-    while let Some(line) = lines.next_line().await? {
+    let authorization = std::sync::Arc::new(tokio::sync::OnceCell::<()>::new());
+    let mut tasks = tokio::task::JoinSet::<Value>::new();
+    let mut waits = std::collections::BTreeMap::<String, tokio::task::AbortHandle>::new();
+    loop {
+        let line = tokio::select! {
+            line = lines.next_line() => match line? { Some(line) => line, None => break },
+            result = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(Ok(response)) = result {
+                    waits.remove(&response["id"].to_string());
+                    write_response(&mut stdout,&response).await?;
+                    stdout.flush().await?;
+                }
+                continue;
+            }
+        };
         let request: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(_) => {
@@ -177,6 +223,14 @@ pub async fn run(client: Client) -> Result<()> {
                 continue;
             }
         };
+        if request["method"] == "notifications/cancelled" {
+            if let Some(id) = request["params"].get("requestId") {
+                if let Some(handle) = waits.remove(&id.to_string()) {
+                    handle.abort();
+                }
+            }
+            continue;
+        }
         let id = request.get("id").cloned();
         if request["method"] == "notifications/initialized" && initialized {
             ready = true;
@@ -202,6 +256,20 @@ pub async fn run(client: Client) -> Result<()> {
                 "ping" => Ok(json!({})),
                 _ if !ready => Err((-32000, "Initialize the session first")),
                 "tools/list" => Ok(definitions(client.signed.is_some())),
+                "broker/call" if internal => {
+                    let name = request["params"]["name"].as_str().unwrap_or("");
+                    let args = request["params"]["arguments"].clone();
+                    let call_id = request["params"]["call_id"].as_str();
+                    let value =
+                        invoke_authorized(&client, name, args, call_id, &authorization).await;
+                    Ok(match value {
+                        Ok(value) => json!({"value":value}),
+                        Err(error) => {
+                            let failure = error.downcast_ref::<crate::signed::StreamFailure>();
+                            json!({"error":{"message":format!("{error:#}"),"status":failure.map(|e|e.status),"retry_after":failure.map(|e|e.retry_after),"code":failure.and_then(|e|e.code.clone())}})
+                        }
+                    })
+                }
                 "tools/call" => {
                     let name = request["params"]["name"].as_str().unwrap_or("");
                     if ![
@@ -210,6 +278,8 @@ pub async fn run(client: Client) -> Result<()> {
                     .contains(&name)
                         && !([
                             "retry",
+                            "operation_status",
+                            "retry_call",
                             "request_approval",
                             "decide_approval",
                             "approvals",
@@ -224,27 +294,34 @@ pub async fn run(client: Client) -> Result<()> {
                             .get("arguments")
                             .cloned()
                             .unwrap_or(json!({}));
-                        let response = if name == "updates" {
-                            crate::updates::fetch(&client, args).await
-                        } else if name == "message" {
-                            crate::updates::message(&client, args).await
-                        } else if name == "retry" {
-                            client
-                                .retry(args["operation_id"].as_str().unwrap_or(""))
-                                .await
-                        } else if name == "receive" {
-                            client.receive(args).await
+                        let call_id = if internal {
+                            request["_broker_call_id"].as_str().map(str::to_owned)
                         } else {
-                            client.call(name, args).await
+                            None
                         };
-                        match response {
-                            Ok(value) => Ok(
-                                json!({"content":[{"type":"text","text":model_view(value).to_string()}],"isError":false}),
-                            ),
-                            Err(e) => Ok(
-                                json!({"content":[{"type":"text","text":e.to_string()}],"isError":true}),
-                            ),
+                        let authorization = authorization.clone();
+                        let client = client.clone();
+                        let name = name.to_owned();
+                        let id = id.clone();
+                        if tasks.len() >= 64 {
+                            stdout.write_all(format!("{}\n",json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":"too many pending requests"}})).as_bytes()).await?;
+                            stdout.flush().await?;
+                            continue;
                         }
+                        let wait_key = id.to_string();
+                        let cancellable = name == "receive";
+                        let handle = tasks.spawn(async move {
+                            let response = invoke_authorized(&client, &name, args,call_id.as_deref(),&authorization).await;
+                            let result = match response {
+                                Ok(value) => json!({"content":[{"type":"text","text":model_view(value).to_string()}],"isError":false}),
+                                Err(e) => json!({"content":[{"type":"text","text":format!("{e:#}")}],"isError":true}),
+                            };
+                            json!({"jsonrpc":"2.0","id":id,"result":result})
+                        });
+                        if cancellable {
+                            waits.insert(wait_key, handle);
+                        }
+                        continue;
                     }
                 }
                 _ => Err((-32601, "Method not found")),
@@ -256,10 +333,96 @@ pub async fn run(client: Client) -> Result<()> {
                 json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
             }
         };
-        stdout.write_all(format!("{response}\n").as_bytes()).await?;
+        write_response(&mut stdout, &response).await?;
         stdout.flush().await?;
     }
     Ok(())
+}
+
+async fn write_response<W: tokio::io::AsyncWrite + Unpin>(
+    output: &mut W,
+    response: &Value,
+) -> Result<()> {
+    let mut frame = serde_json::to_vec(response)?;
+    if frame.len() + 1 > crate::framing::MAX_FRAME {
+        frame = serde_json::to_vec(
+            &json!({"jsonrpc":"2.0","id":response["id"],"error":{"code":-32000,"message":"response exceeds 16 MiB; request a smaller page"}}),
+        )?;
+    }
+    frame.push(b'\n');
+    output.write_all(&frame).await?;
+    Ok(())
+}
+async fn invoke_authorized(
+    client: &Client,
+    name: &str,
+    args: Value,
+    id: Option<&str>,
+    authorization: &tokio::sync::OnceCell<()>,
+) -> Result<Value> {
+    anyhow::ensure!(
+        [
+            "join",
+            "codec",
+            "send",
+            "history",
+            "receive",
+            "updates",
+            "message",
+            "retry",
+            "operation_status",
+            "retry_call",
+            "request_approval",
+            "decide_approval",
+            "approvals",
+            "approval"
+        ]
+        .contains(&name),
+        "unknown broker operation"
+    );
+    if name == "receive" {
+        authorization
+            .get_or_try_init(|| async {
+                client.call("identity", json!({})).await?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+    }
+    invoke_id(client, name, args, id).await
+}
+async fn invoke_id(client: &Client, name: &str, args: Value, id: Option<&str>) -> Result<Value> {
+    if matches!(
+        name,
+        "send" | "codec" | "request_approval" | "decide_approval"
+    ) {
+        let id = id
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        client.call_id(name, args, &id).await.map_err(|error| {
+            error.context(format!(
+                "broker call {id}; inspect outbox before issuing a new post"
+            ))
+        })
+    } else {
+        invoke(client, name, args).await
+    }
+}
+async fn invoke(client: &Client, name: &str, args: Value) -> Result<Value> {
+    let response = if name == "updates" {
+        crate::updates::fetch(&client, args).await
+    } else if name == "message" {
+        crate::updates::message(&client, args).await
+    } else if name == "retry" {
+        client
+            .retry(args["operation_id"].as_str().unwrap_or(""))
+            .await
+    } else if name == "receive" {
+        client.receive(args).await
+    } else {
+        client.call(name, args).await
+    };
+
+    response
 }
 
 #[cfg(test)]

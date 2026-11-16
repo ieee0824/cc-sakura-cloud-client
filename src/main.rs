@@ -1,10 +1,19 @@
 mod approvals;
+#[cfg(unix)]
+mod broker;
 mod browser_proof;
 mod diagnostics;
 mod e2ee;
+mod flight;
+mod framing;
 mod key_delivery;
+mod limits;
 mod mcp;
+mod metrics;
+mod paths;
+mod quota;
 mod signed;
+mod subscription;
 mod timing;
 mod updates;
 mod watch;
@@ -35,6 +44,9 @@ struct Cli {
     config: Option<PathBuf>,
     #[arg(long, global = true)]
     timings: bool,
+    /// Use an isolated in-process client instead of the local broker.
+    #[arg(long, global = true)]
+    direct: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -114,6 +126,29 @@ enum Command {
         command: ApprovalCommand,
     },
     Mcp,
+    /// Serve shared MCP sessions on a private Unix socket.
+    #[cfg(unix)]
+    Daemon {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(value_enum, default_value = "serve")]
+        action: DaemonAction,
+    },
+    /// Connect an MCP stdio session to a running shared daemon.
+    #[cfg(unix)]
+    Proxy {
+        #[arg(long)]
+        socket: PathBuf,
+    },
+}
+#[cfg(unix)]
+#[derive(Clone, clap::ValueEnum)]
+enum DaemonAction {
+    Serve,
+    Start,
+    Status,
+    Stop,
+    Restart,
 }
 #[derive(Subcommand)]
 enum ApprovalCommand {
@@ -174,6 +209,12 @@ enum AuthCommand {
     },
     Retry {
         operation_id: String,
+    },
+    CallStatus {
+        call_id: String,
+    },
+    RetryCall {
+        call_id: String,
     },
 }
 
@@ -241,16 +282,55 @@ async fn main() -> Result<()> {
         }
         _ => {}
     }
-    let path = cli.config.unwrap_or_else(|| {
-        PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/ccSakura.toml")
-    });
+    #[cfg(unix)]
+    if let Command::Daemon { socket, action } = &cli.command {
+        let path = match socket {
+            Some(path) => path.clone(),
+            None => broker::runtime_socket()?,
+        };
+        return broker::manage(&path, action).await;
+    }
+    let path = match cli.config {
+        Some(path) => path,
+        None => paths::home()?.join(".config/ccSakura.toml"),
+    };
+    #[cfg(unix)]
+    if let Command::Proxy { socket } = &cli.command {
+        return broker::proxy(socket, &path, false).await;
+    }
+    #[cfg(unix)]
+    if matches!(&cli.command, Command::Mcp) && !cli.direct {
+        return broker::proxy(&broker::runtime_socket()?, &path, true).await;
+    }
     let config: Config = toml::from_str(
         &std::fs::read_to_string(&path).context("read client profile; use auth join first")?,
     )
     .context("invalid client profile")?;
-    let client = client_from_config(&config, None, None)?;
+    let client = {
+        #[cfg(unix)]
+        if !cli.direct {
+            Client {
+                remote: Some(std::sync::Arc::new(std::fs::canonicalize(&path)?)),
+                profile_auth: config.auth.clone(),
+                invalidated: Default::default(),
+                subscriptions: Default::default(),
+                receivers: Default::default(),
+                reconnect: Default::default(),
+                http: reqwest::Client::new(),
+                signed: None,
+            }
+        } else {
+            client_from_config(&config, None, None)?
+        }
+        #[cfg(not(unix))]
+        {
+            client_from_config(&config, None, None)?
+        }
+    };
     match cli.command {
         Command::Auth{command:AuthCommand::Retry{operation_id}}=>println!("{}",client.retry(&operation_id).await?),
+        Command::Auth{command:AuthCommand::CallStatus{call_id}}=>println!("{}",client.call("operation_status",json!({"call_id":call_id})).await?),
+        Command::Auth{command:AuthCommand::RetryCall{call_id}}=>println!("{}",client.call("retry_call",json!({"call_id":call_id})).await?),
         Command::Auth{..}=>unreachable!(),
         Command::Approval{command}=> {
             let (op,args)=match command {
@@ -262,7 +342,11 @@ async fn main() -> Result<()> {
             println!("{}",mcp::model_view(client.call(op,args).await?));
         },
         Command::Mcp=>mcp::run(client).await?,
-        Command::Join{room,handle,id}=>println!("{}",client.call("join",json!({"room":room,"handle":handle,"id":id.map(|v|v.to_string()).unwrap_or_else(||client.signed.as_ref().unwrap().auth.member_id.clone())})).await?),
+        #[cfg(unix)]
+        Command::Daemon{..}=>unreachable!(),
+        #[cfg(unix)]
+        Command::Proxy{..}=>unreachable!(),
+        Command::Join{room,handle,id}=>println!("{}",client.call("join",json!({"room":room,"handle":handle,"id":id.map(|v|v.to_string()).unwrap_or(client.auth()?.member_id.clone())})).await?),
         Command::Send{room,payload,codec,gloss,mention}=>{
             let payload:Value=serde_json::from_str(&payload).context("payload must be JSON")?;
             println!("{}",client.call("send",json!({"room":room,"payload":payload,"codec":codec,"gloss":gloss,"mentions":mention})).await?);
@@ -283,25 +367,9 @@ async fn main() -> Result<()> {
         }
         Command::Receive{room,after,timeout_seconds}=>println!("{}",client.receive(json!({"room":room,"after":after,"timeout_seconds":timeout_seconds})).await?),
         Command::History{room,mut after,limit,mentions,raw,compact,follow}=>{
-            let mut stream:Option<Events>=None;
             loop {
                 let args=json!({"room":room,"after":after,"limit":limit,"mentions":mentions,"include_human":!raw});
-                let value=if follow {
-                    if stream.is_none(){
-                        match client.events(&args).await {
-                            Ok(Some(events))=>stream=Some(events),
-                            Ok(None)=>bail!("signed event stream required"),
-                            Err(error) if transient(&error)||error.to_string()=="event connection timed out"=>{eprintln!("event reconnect");client.note_stream_error(&error).await;client.reconnect_wait().await;continue;}
-                            Err(error)=>return Err(error),
-                        }
-                    }
-                    match stream.as_mut().unwrap().next().await {
-                        Ok(Some(value))=>value,
-                        Ok(None)=>{client.stable_connection(stream.as_ref().is_some_and(Events::stable)).await;stream=None;client.reconnect_wait().await;continue;}
-                        Err(error) if transient(&error)||error.to_string()=="event heartbeat timed out"=>{client.note_stream_error(&error).await;stream=None;client.reconnect_wait().await;continue;}
-                        Err(error)=>return Err(error),
-                    }
-                }else{client.call("history",args).await?};
+                let value=if follow {client.receive(args).await?} else {client.call("history",args).await?};
                 let messages=value["messages"].as_array().context("missing messages")?;
                 for message in messages {after=after.max(message["id"].as_i64().context("missing message id")?);}
                 println!("{}",if compact {mcp::model_view(value)} else {value});
@@ -329,6 +397,15 @@ mod config_tests {
 
 #[derive(Clone)]
 pub struct Client {
+    invalidated: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(unix)]
+    remote: Option<std::sync::Arc<std::path::PathBuf>>,
+    profile_auth: Option<signed::AuthConfig>,
+    subscriptions: std::sync::Arc<
+        tokio::sync::Mutex<
+            std::collections::BTreeMap<String, std::sync::Arc<subscription::Subscription>>,
+        >,
+    >,
     receivers: std::sync::Arc<
         tokio::sync::Mutex<
             std::collections::BTreeMap<String, std::sync::Arc<tokio::sync::Mutex<Receiver>>>,
@@ -350,13 +427,68 @@ struct Reconnect {
     not_before: Option<tokio::time::Instant>,
 }
 pub struct Events {
+    expires_at: Option<i64>,
+    expiry: Option<tokio::task::JoinHandle<()>>,
+    _permits: Option<(
+        tokio::sync::OwnedSemaphorePermit,
+        tokio::sync::OwnedSemaphorePermit,
+    )>,
+    observer: Option<(
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::sync::Arc<tokio::sync::Notify>,
+    )>,
     opened: std::time::Instant,
     response: reqwest::Response,
     buffer: Vec<u8>,
     handshake: Option<(String, Value, u8, Option<String>)>,
     verifier: Option<(std::sync::Arc<signed::SignedClient>, reqwest::Client)>,
 }
+impl Drop for Events {
+    fn drop(&mut self) {
+        if let Some(timer) = self.expiry.take() {
+            timer.abort();
+        }
+        if self._permits.is_some() {
+            metrics::STREAMS_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some((active, changed)) = &self.observer {
+            active.store(false, std::sync::atomic::Ordering::SeqCst);
+            changed.notify_waiters();
+        }
+    }
+}
 impl Events {
+    fn observe(
+        &mut self,
+        observer: Option<(
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+            std::sync::Arc<tokio::sync::Notify>,
+        )>,
+    ) -> Result<()> {
+        self.observer = observer;
+        if let Some(timer) = self.expiry.take() {
+            timer.abort();
+        }
+        let ready = self.handshake.as_ref().is_none_or(|h| h.2 == 2);
+        if ready && self.expires_at.is_none() {
+            self.expires_at = Some(signed::now()? + 1800);
+        }
+        if let Some((active, changed)) = &self.observer {
+            let remaining = self.expires_at.unwrap_or(0) - signed::now()?;
+            active.store(ready && remaining > 0, std::sync::atomic::Ordering::SeqCst);
+            changed.notify_waiters();
+            if ready && remaining > 0 {
+                let active = active.clone();
+                let changed = changed.clone();
+                self.expiry = Some(tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(remaining as u64)).await;
+                    active.store(false, std::sync::atomic::Ordering::SeqCst);
+                    changed.notify_waiters();
+                }));
+            }
+        }
+        Ok(())
+    }
     fn stable(&self) -> bool {
         self.opened.elapsed() >= std::time::Duration::from_secs(60)
     }
@@ -366,6 +498,17 @@ impl Events {
     }
     async fn next_inner(&mut self) -> Result<Option<Value>> {
         loop {
+            if self
+                .expires_at
+                .is_some_and(|deadline| signed::now().is_ok_and(|now| now >= deadline))
+            {
+                return Err(signed::StreamFailure {
+                    status: 503,
+                    retry_after: 1,
+                    code: Some("stream_renewal_required".into()),
+                }
+                .into());
+            }
             let boundary = self
                 .buffer
                 .windows(2)
@@ -409,11 +552,32 @@ impl Events {
                                     "stream connection mismatch"
                                 );
                                 *phase = 2;
+                                let expires = value["expires_at"]
+                                    .as_i64()
+                                    .context("missing stream expiry")?;
+                                anyhow::ensure!(
+                                    expires > signed::now()? && expires <= signed::now()? + 1830,
+                                    "invalid stream expiry"
+                                );
+                                self.expires_at = Some(expires);
+                                self.observe(self.observer.clone())?;
                                 continue;
                             }
                             "messages" if *phase == 2 => {}
                             "error" => {
+                                if let Some((client, _)) = &self.verifier {
+                                    let origin = url::Url::parse(&client.project_url)?
+                                        .origin()
+                                        .ascii_serialization();
+                                    quota::note(
+                                        &origin,
+                                        value["status"].as_u64().unwrap_or(503) as u16,
+                                        value["code"].as_str(),
+                                        value["retry_after"].as_u64().unwrap_or(60),
+                                    )?;
+                                }
                                 return Err(signed::StreamFailure {
+                                    code: value["code"].as_str().map(str::to_owned),
                                     status: value["status"].as_u64().unwrap_or(503) as u16,
                                     retry_after: value["retry_after"].as_u64().unwrap_or(0),
                                 }
@@ -423,6 +587,11 @@ impl Events {
                         }
                     }
 
+                    anyhow::ensure!(
+                        self.expires_at
+                            .is_none_or(|deadline| signed::now().is_ok_and(|now| now < deadline)),
+                        "stream access expired"
+                    );
                     let value = if let Some((client, http)) = &self.verifier {
                         client.verify_history(http, value).await?
                     } else {
@@ -464,6 +633,22 @@ fn transient(error: &anyhow::Error) -> bool {
     })
 }
 impl Client {
+    fn check_valid(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.invalidated.load(std::sync::atomic::Ordering::SeqCst),
+            "profile changed; reconnect with the current configuration"
+        );
+        Ok(())
+    }
+
+    fn auth(&self) -> Result<&signed::AuthConfig> {
+        self.signed
+            .as_ref()
+            .map(|c| &c.auth)
+            .or(self.profile_auth.as_ref())
+            .context("signed profile required")
+    }
+
     async fn note_stream_error(&self, error: &anyhow::Error) {
         if let Some(e) = error.downcast_ref::<signed::StreamFailure>() {
             let until = tokio::time::Instant::now()
@@ -473,6 +658,7 @@ impl Client {
         }
     }
     async fn reconnect_wait(&self) {
+        metrics::RECONNECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let until = {
             let mut state = self.reconnect.lock().await;
             let seconds = (1u64 << state.failures.min(6)).min(60);
@@ -509,6 +695,8 @@ impl Client {
             .signed
             .as_ref()
             .context("signed authentication required")?;
+        let permits = limits::stream(&signed.stream_scope())?;
+        metrics::STREAM_STARTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let capable = signed.stream_capable(&self.http).await?;
         let (response, handshake) = if capable {
             let (response, nonce) = tokio::time::timeout(
@@ -529,7 +717,12 @@ impl Client {
                 None,
             )
         };
+        metrics::STREAMS_ACTIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Some(Events {
+            expires_at: None,
+            expiry: None,
+            _permits: Some(permits),
+            observer: None,
             opened: std::time::Instant::now(),
             response,
             handshake,
@@ -538,7 +731,26 @@ impl Client {
         }))
     }
 
-    async fn receive(&self, mut args: Value) -> Result<Value> {
+    async fn receive(&self, args: Value) -> Result<Value> {
+        self.check_valid()?;
+        #[cfg(unix)]
+        if let Some(profile) = &self.remote {
+            return broker::call(profile, "receive", args).await;
+        }
+        subscription::receive(self, args).await
+    }
+    #[cfg(test)]
+    async fn receive_direct(&self, args: Value) -> Result<Value> {
+        self.receive_observed(args, None).await
+    }
+    async fn receive_observed(
+        &self,
+        mut args: Value,
+        observer: Option<(
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+            std::sync::Arc<tokio::sync::Notify>,
+        )>,
+    ) -> Result<Value> {
         let seconds = args["timeout_seconds"]
             .as_u64()
             .unwrap_or(300)
@@ -561,6 +773,9 @@ impl Client {
         let mut receiver = tokio::time::timeout_at(deadline, slot.lock())
             .await
             .context("receive already waiting")?;
+        if let Some(stream) = receiver.stream.as_mut() {
+            stream.observe(observer.clone())?;
+        }
         if requested < receiver.after {
             if let Some(last) = &receiver.last {
                 let first = last["messages"]
@@ -587,7 +802,12 @@ impl Client {
             if receiver.stream.is_none() {
                 args["after"] = json!(receiver.after);
                 match tokio::time::timeout_at(deadline, self.events(&args)).await {
-                    Ok(Ok(stream)) => receiver.stream = stream,
+                    Ok(Ok(mut stream)) => {
+                        if let Some(stream) = stream.as_mut() {
+                            stream.observe(observer.clone())?;
+                        }
+                        receiver.stream = stream;
+                    }
                     Ok(Err(e))
                         if transient(&e) || e.to_string() == "event connection timed out" =>
                     {
@@ -637,17 +857,46 @@ impl Client {
                 break;
             }
         }
-        args["after"] = json!(requested);
-        self.call("history", args).await
+        if receiver
+            .stream
+            .as_ref()
+            .is_some_and(|stream| stream.handshake.as_ref().is_none_or(|h| h.2 == 2))
+        {
+            return Ok(json!({"messages":[],"has_more":false}));
+        }
+        Err(signed::StreamFailure {
+            status: 503,
+            retry_after: 1,
+            code: Some("subscription_reconnecting".into()),
+        }
+        .into())
     }
     async fn retry(&self, operation_id: &str) -> Result<Value> {
+        self.check_valid()?;
+        #[cfg(unix)]
+        if let Some(profile) = &self.remote {
+            return broker::call(profile, "retry", json!({"operation_id":operation_id})).await;
+        }
         self.signed
             .as_ref()
             .context("retry requires signed authentication")?
             .retry(&self.http, operation_id)
             .await
     }
+    async fn call_id(&self, operation: &str, args: Value, id: &str) -> Result<Value> {
+        self.check_valid()?;
+        self.signed
+            .as_ref()
+            .context("signed authentication required")?
+            .call_id(&self.http, operation, args, id)
+            .await
+    }
     async fn call(&self, operation: &str, args: Value) -> Result<Value> {
+        self.check_valid()?;
+        #[cfg(unix)]
+        if let Some(profile) = &self.remote {
+            return broker::call(profile, operation, args).await;
+        }
         self.signed
             .as_ref()
             .context("signed authentication required")?
@@ -691,6 +940,11 @@ fn client_from_config(
     }
     Ok(Client {
         receivers: Default::default(),
+        subscriptions: Default::default(),
+        #[cfg(unix)]
+        remote: None,
+        profile_auth: None,
+        invalidated: Default::default(),
         reconnect: Default::default(),
         http: http.build()?,
         signed,
@@ -756,10 +1010,16 @@ mod reconnect_tests {
             signed: None,
             reconnect: Default::default(),
             receivers: Default::default(),
+            subscriptions: Default::default(),
+            #[cfg(unix)]
+            remote: None,
+            profile_auth: None,
+            invalidated: Default::default(),
         };
         client
             .note_stream_error(
                 &signed::StreamFailure {
+                    code: None,
                     status: 429,
                     retry_after: 120,
                 }
@@ -777,6 +1037,7 @@ mod reconnect_tests {
         assert!(until > tokio::time::Instant::now() + std::time::Duration::from_secs(119));
         assert!(transient(
             &signed::StreamFailure {
+                code: None,
                 status: 503,
                 retry_after: 0
             }
@@ -784,6 +1045,7 @@ mod reconnect_tests {
         ));
         assert!(!transient(
             &signed::StreamFailure {
+                code: None,
                 status: 403,
                 retry_after: 0
             }
@@ -812,6 +1074,10 @@ mod stream_receiver_tests {
     async fn receive_reuses_stream_and_replays_cached_page_by_cursor() {
         let (response,task)=response("event: messages\ndata: {\"messages\":[{\"id\":1}]}\n\nevent: messages\ndata: {\"messages\":[{\"id\":2}]}\n\n").await;
         let stream = Events {
+            expires_at: None,
+            expiry: None,
+            _permits: None,
+            observer: None,
             response,
             opened: std::time::Instant::now(),
             buffer: vec![],
@@ -823,6 +1089,11 @@ mod stream_receiver_tests {
             signed: None,
             reconnect: Default::default(),
             receivers: Default::default(),
+            subscriptions: Default::default(),
+            #[cfg(unix)]
+            remote: None,
+            profile_auth: None,
+            invalidated: Default::default(),
         };
         let args = json!({"after":0,"timeout_seconds":2});
         client.receivers.lock().await.insert(
@@ -834,13 +1105,16 @@ mod stream_receiver_tests {
             })),
         );
         assert_eq!(
-            client.receive(args.clone()).await.unwrap()["messages"][0]["id"],
+            client.receive_direct(args.clone()).await.unwrap()["messages"][0]["id"],
             1
         );
-        assert_eq!(client.receive(args).await.unwrap()["messages"][0]["id"], 1);
+        assert_eq!(
+            client.receive_direct(args).await.unwrap()["messages"][0]["id"],
+            1
+        );
         assert_eq!(
             client
-                .receive(json!({"after":1,"timeout_seconds":2}))
+                .receive_direct(json!({"after":1,"timeout_seconds":2}))
                 .await
                 .unwrap()["messages"][0]["id"],
             2
@@ -849,9 +1123,48 @@ mod stream_receiver_tests {
         task.abort();
     }
     #[tokio::test]
+    async fn observer_is_invalidated_at_expiry_and_on_drop() -> Result<()> {
+        let (response, server) = response("").await;
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let changed = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mut events = Events {
+            expires_at: Some(signed::now()? + 1),
+            expiry: None,
+            _permits: None,
+            observer: None,
+            opened: std::time::Instant::now(),
+            response,
+            buffer: vec![],
+            handshake: None,
+            verifier: None,
+        };
+        events.observe(Some((active.clone(), changed.clone())))?;
+        assert!(active.load(std::sync::atomic::Ordering::SeqCst));
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        assert!(!active.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            events
+                .next()
+                .await
+                .unwrap_err()
+                .downcast_ref::<signed::StreamFailure>()
+                .is_some()
+        );
+        events.expires_at = Some(signed::now()? + 30);
+        events.observe(Some((active.clone(), changed)))?;
+        drop(events);
+        assert!(!active.load(std::sync::atomic::Ordering::SeqCst));
+        server.abort();
+        Ok(())
+    }
+    #[tokio::test]
     async fn rejects_messages_before_authentication_and_classifies_sse_errors() {
         let (response, task) = response("event: messages\ndata: {\"messages\":[]}\n\n").await;
         let mut events = Events {
+            expires_at: None,
+            expiry: None,
+            _permits: None,
+            observer: None,
             response,
             opened: std::time::Instant::now(),
             buffer: vec![],

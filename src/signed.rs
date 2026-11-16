@@ -26,29 +26,62 @@ use uuid::Uuid;
 pub struct StreamFailure {
     pub status: u16,
     pub retry_after: u64,
+    pub code: Option<String>,
 }
 impl std::fmt::Display for StreamFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "stream HTTP status {}", self.status)
+        if self.code.as_deref() == Some("encryption_key_pending") {
+            return write!(
+                f,
+                "room key delivery pending; retry after {} seconds",
+                self.retry_after
+            );
+        }
+        write!(
+            f,
+            "stream HTTP status {}{}",
+            self.status,
+            self.code
+                .as_ref()
+                .map(|code| format!(" ({code})"))
+                .unwrap_or_default()
+        )
     }
 }
 impl std::error::Error for StreamFailure {}
-fn stream_response(response: reqwest::Response) -> Result<reqwest::Response> {
-    if !response.status().is_success() {
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0)
-            .min(86400);
-        return Err(StreamFailure {
-            status: response.status().as_u16(),
-            retry_after,
-        }
-        .into());
+async fn stream_response(mut response: reqwest::Response) -> Result<reqwest::Response> {
+    if response.status().is_success() {
+        return Ok(response);
     }
-    Ok(response)
+    let status = response.status().as_u16();
+    let origin = response.url().origin().ascii_serialization();
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(if status == 429 { 60 } else { 0 })
+        .min(86400);
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        ensure!(
+            bytes.len() + chunk.len() <= 16384,
+            "server error response too large"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    let code = value["code"]
+        .as_str()
+        .filter(|s| s.len() <= 100 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+        .map(str::to_owned);
+    crate::quota::note(&origin, status, code.as_deref(), retry_after)?;
+    Err(StreamFailure {
+        status,
+        retry_after,
+        code,
+    }
+    .into())
 }
 const TYPE: &str = "cc-sakura-request-v1+jws";
 const MAX_COMPACT: usize = 2 * 1024 * 1024;
@@ -512,8 +545,24 @@ pub struct SignedClient {
     key: Arc<SigningKey>,
     outbox: PathBuf,
     room_key: Arc<std::sync::Mutex<Option<crate::e2ee::Recovery>>>,
+    key_sync: Arc<tokio::sync::Mutex<()>>,
+    keyring: Arc<std::sync::Mutex<std::collections::BTreeMap<String, crate::e2ee::Recovery>>>,
+    mutation: Arc<tokio::sync::Mutex<()>>,
+    ledger: PathBuf,
+    reads: Arc<crate::flight::Flights>,
+    registered_device: Arc<std::sync::Mutex<Option<String>>>,
+    key_retry: Arc<std::sync::Mutex<std::collections::BTreeMap<String, std::time::Instant>>>,
 }
 impl SignedClient {
+    pub(crate) fn stream_scope(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.project_url,
+            self.auth.project_id,
+            key_id(self.key.verifying_key().as_bytes())
+        )
+    }
+
     fn recovery(&self) -> Result<Option<crate::e2ee::Recovery>> {
         let cached = self
             .room_key
@@ -566,6 +615,16 @@ impl SignedClient {
         http: &reqwest::Client,
     ) -> Result<crate::key_delivery::Device> {
         let device = self.encryption_device()?;
+        let id = device.id()?;
+        if self
+            .registered_device
+            .lock()
+            .map_err(|_| anyhow::anyhow!("device registration state unavailable"))?
+            .as_deref()
+            == Some(&id)
+        {
+            return Ok(device);
+        }
         let result = self
             .send_action(
                 http,
@@ -580,9 +639,17 @@ impl SignedClient {
             result["device_id"].as_str() == Some(&device.id()?),
             "registered delivery key mismatch"
         );
+        *self
+            .registered_device
+            .lock()
+            .map_err(|_| anyhow::anyhow!("device registration state unavailable"))? = Some(id);
         Ok(device)
     }
-    async fn sync_room_key(&self, http: &reqwest::Client, key_id: &str) -> Result<()> {
+    async fn sync_room_key(
+        &self,
+        http: &reqwest::Client,
+        key_id: &str,
+    ) -> Result<crate::e2ee::Recovery> {
         crate::timing::measure(
             "e2ee.key_sync",
             "encryption-key",
@@ -590,20 +657,80 @@ impl SignedClient {
         )
         .await
     }
-    async fn sync_room_key_inner(&self, http: &reqwest::Client, key_id: &str) -> Result<()> {
-        if self
-            .room_key
-            .lock()
-            .map_err(|_| anyhow::anyhow!("room key state unavailable"))?
-            .as_ref()
-            .is_some_and(|r| r.key_id == key_id)
+    async fn sync_room_key_inner(
+        &self,
+        http: &reqwest::Client,
+        key_id: &str,
+    ) -> Result<crate::e2ee::Recovery> {
+        let _guard = self.key_sync.lock().await;
         {
-            return Ok(());
+            let mut pauses = self
+                .key_retry
+                .lock()
+                .map_err(|_| anyhow::anyhow!("key retry state unavailable"))?;
+            pauses.retain(|_, until| *until > std::time::Instant::now());
+            if pauses.contains_key(key_id) {
+                return Err(StreamFailure {
+                    status: 503,
+                    retry_after: 5,
+                    code: Some("encryption_key_pending".into()),
+                }
+                .into());
+            }
+        }
+        let result = self.sync_room_key_fetch(http, key_id).await;
+        if let Err(error) = &result {
+            if error.to_string().contains("room key delivery pending") {
+                self.key_retry
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("key retry state unavailable"))?
+                    .insert(
+                        key_id.to_owned(),
+                        std::time::Instant::now() + Duration::from_secs(5),
+                    );
+                return Err(StreamFailure {
+                    status: 503,
+                    retry_after: 5,
+                    code: Some("encryption_key_pending".into()),
+                }
+                .into());
+            }
+        }
+        result
+    }
+    async fn sync_room_key_fetch(
+        &self,
+        http: &reqwest::Client,
+        key_id: &str,
+    ) -> Result<crate::e2ee::Recovery> {
+        if let Some(key) = self
+            .keyring
+            .lock()
+            .map_err(|_| anyhow::anyhow!("key cache unavailable"))?
+            .get(key_id)
+            .cloned()
+        {
+            return Ok(key);
         }
         let existing = self.recovery()?;
+        if let Some(cached) = self
+            .room_key
+            .lock()
+            .map_err(|_| anyhow::anyhow!("room key cache unavailable"))?
+            .as_ref()
+            .filter(|r| r.key_id == key_id)
+            .cloned()
+        {
+            self.keyring
+                .lock()
+                .map_err(|_| anyhow::anyhow!("key cache unavailable"))?
+                .insert(key_id.to_owned(), cached.clone());
+            return Ok(cached);
+        }
         let mut recovery = if let Some(key) = existing.filter(|r| r.key_id == key_id) {
             key
         } else {
+            crate::metrics::KEY_FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let device = self.register_encryption_device(http).await?;
             let delivery = self
                 .send_action(http, &self.action("encryption-key", json!({}), None)?)
@@ -625,8 +752,22 @@ impl SignedClient {
         *self
             .room_key
             .lock()
-            .map_err(|_| anyhow::anyhow!("room key state unavailable"))? = Some(recovery);
-        Ok(())
+            .map_err(|_| anyhow::anyhow!("room key state unavailable"))? = Some(recovery.clone());
+        let mut keyring = self
+            .keyring
+            .lock()
+            .map_err(|_| anyhow::anyhow!("key cache unavailable"))?;
+        keyring.insert(key_id.to_owned(), recovery.clone());
+        while keyring.len() > 4 {
+            let victim = keyring.keys().find(|key| key.as_str() != key_id).cloned();
+            if let Some(victim) = victim {
+                keyring.remove(&victim);
+            } else {
+                break;
+            }
+        }
+
+        Ok(recovery)
     }
     pub fn new(project_url: &str, auth: AuthConfig, compat: CompatConfig) -> Result<Self> {
         ensure!(auth.mode == "signed", "auth.mode must be signed");
@@ -673,12 +814,7 @@ impl SignedClient {
             .context("invalid Ed25519 PKCS#8 private key")?;
         let outbox = match &auth.outbox_file {
             Some(path) => path.clone(),
-            None => std::env::var_os("XDG_STATE_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| {
-                    PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state")
-                })
-                .join("cc-sakura/outbox.sqlite3"),
+            None => crate::paths::default_outbox()?,
         };
         ensure!(outbox.is_absolute(), "outbox_file must be absolute");
         Ok(Self {
@@ -689,6 +825,13 @@ impl SignedClient {
             key: Arc::new(key),
             outbox,
             room_key: Arc::new(std::sync::Mutex::new(None)),
+            key_sync: Default::default(),
+            keyring: Default::default(),
+            mutation: Default::default(),
+            reads: Default::default(),
+            registered_device: Default::default(),
+            key_retry: Default::default(),
+            ledger: crate::paths::state_directory()?.join("broker-operations.sqlite3"),
         })
     }
     fn outbox(&self) -> Result<Connection> {
@@ -795,6 +938,14 @@ impl SignedClient {
         action: &RawValue,
         events: bool,
     ) -> Result<reqwest::Response> {
+        let origin = url::Url::parse(&self.project_url)?
+            .origin()
+            .ascii_serialization();
+        if events {
+            crate::quota::stream_start(&origin)?;
+        } else {
+            crate::quota::before(&origin)?;
+        }
         let suffix = if events { "events" } else { "rpc" };
         let endpoint = format!("/{}/api/v1/{suffix}", self.project_name);
         let op = serde_json::from_str::<Action>(action.get())?.op;
@@ -830,8 +981,8 @@ impl SignedClient {
     }
     async fn response(response: reqwest::Response) -> Result<Value> {
         let status = response.status();
-        let response = if status.is_server_error() || status.as_u16() == 429 {
-            stream_response(response)?
+        let response = if !status.is_success() {
+            stream_response(response).await?
         } else {
             response
         };
@@ -857,6 +1008,41 @@ impl SignedClient {
     }
     async fn send_action(&self, http: &reqwest::Client, action: &RawValue) -> Result<Value> {
         let op = serde_json::from_str::<Action>(action.get())?.op;
+        if [
+            "identity",
+            "history",
+            "keys",
+            "codecs",
+            "approvals",
+            "approval",
+            "encryption-key",
+            "encryption-history",
+        ]
+        .contains(&op.as_str())
+        {
+            let key = digest(action.get().as_bytes());
+            let client = self.clone();
+            let http = http.clone();
+            let action = action.to_owned();
+            return self
+                .reads
+                .run(key, async move {
+                    client.send_action_unshared(&http, &action).await
+                })
+                .await;
+        }
+        self.send_action_unshared(http, action).await
+    }
+    async fn send_action_unshared(
+        &self,
+        http: &reqwest::Client,
+        action: &RawValue,
+    ) -> Result<Value> {
+        let op = serde_json::from_str::<Action>(action.get())?.op;
+        let _permit = crate::limits::rpc()
+            .acquire()
+            .await
+            .context("RPC limiter closed")?;
         let response = self.request(http, action, false).await?;
         crate::timing::measure("http.body_and_json", &op, Self::response(response)).await
     }
@@ -869,7 +1055,14 @@ impl SignedClient {
     }
     fn decrypt_history_message(&self, message: &mut Value) -> Result<()> {
         if message["payload"]["type"] == "e2ee-v1" {
-            if let Some(recovery) = self.recovery()? {
+            let key_id = message["payload"]["key_id"].as_str().unwrap_or("");
+            let cached = self
+                .keyring
+                .lock()
+                .map_err(|_| anyhow::anyhow!("key cache unavailable"))?
+                .get(key_id)
+                .cloned();
+            if let Some(recovery) = cached.or(self.recovery()?) {
                 let clear = crate::timing::measure_sync("e2ee.decrypt", "history", || {
                     recovery.decrypt(
                         message["sender"].as_str().context("missing sender")?,
@@ -1180,20 +1373,195 @@ impl SignedClient {
         operation: &str,
         args: Value,
     ) -> Result<Value> {
+        if operation == "operation_status" {
+            return self.call_status(args["call_id"].as_str().context("missing call ID")?);
+        }
+        if operation == "retry_call" {
+            let status = self.call_status(args["call_id"].as_str().context("missing call ID")?)?;
+            ensure!(
+                status["state"] != "reserved",
+                "operation was not saved for transmission; inspect it before issuing a new post"
+            );
+            return self
+                .retry(
+                    http,
+                    status["operation_id"]
+                        .as_str()
+                        .context("missing saved operation ID")?,
+                )
+                .await;
+        }
         crate::timing::measure(
             "operation",
             operation,
-            self.call_inner(http, operation, args),
+            self.call_inner(http, operation, args, None),
         )
         .await
+    }
+    pub fn call_status(&self, id: &str) -> Result<Value> {
+        canonical_uuid(id)?;
+        private_existing(&self.ledger)?;
+        let row: Option<(String, String, String, bool)> = Connection::open(&self.ledger)?
+            .query_row(
+                "SELECT scope,operation_id,outbox,prepared FROM broker_calls WHERE call_id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let (scope, operation, outbox, prepared) = row.context("unknown broker call ID")?;
+        ensure!(
+            scope
+                == json!([
+                    self.project_url,
+                    self.auth.server_id,
+                    self.auth.project_id,
+                    self.auth.member_id,
+                    key_id(self.key.verifying_key().as_bytes())
+                ])
+                .to_string()
+                && outbox == self.outbox.to_string_lossy(),
+            "call belongs to another identity or outbox"
+        );
+        let result: Option<Option<String>> = if self.outbox.exists() {
+            self.outbox()?
+                .query_row(
+                    "SELECT result FROM signed_outbox WHERE id=?1",
+                    [&operation],
+                    |r| r.get(0),
+                )
+                .optional()?
+        } else {
+            None
+        };
+        ensure!(
+            !prepared || result.is_some(),
+            "saved operation is missing from outbox; inspect before creating a new post"
+        );
+        let state = match &result {
+            Some(Some(_)) => "complete",
+            Some(None) => "pending",
+            None => "reserved",
+        };
+        Ok(
+            json!({"call_id":id,"operation_id":operation,"state":state,"result":result.flatten().map(|text|serde_json::from_str::<Value>(&text)).transpose()?}),
+        )
+    }
+    pub async fn call_id(
+        &self,
+        http: &reqwest::Client,
+        operation: &str,
+        args: Value,
+        call_id: &str,
+    ) -> Result<Value> {
+        ensure!(
+            matches!(
+                operation,
+                "send" | "codec" | "request_approval" | "decide_approval"
+            ),
+            "call ID requires a posting operation"
+        );
+        canonical_uuid(call_id)?;
+        let _guard = self.mutation.lock().await;
+        let operation_id = self.reserve_call(operation, &args, call_id)?;
+        let exists: bool = self.outbox()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM signed_outbox WHERE id=?1)",
+            [&operation_id],
+            |r| r.get(0),
+        )?;
+        if exists {
+            return self.retry(http, &operation_id).await;
+        }
+        self.call_inner(http, operation, args, Some(operation_id))
+            .await
+    }
+    fn reserve_call(&self, operation: &str, args: &Value, call_id: &str) -> Result<String> {
+        ensure!(self.ledger.is_absolute(), "ledger path must be absolute");
+        if !self.ledger.exists() {
+            match create_private(&self.ledger) {
+                Ok(file) => file.sync_all()?,
+                Err(error) if self.ledger.exists() => drop(error),
+                Err(error) => return Err(error),
+            }
+        }
+        private_existing(&self.ledger)?;
+        let db = Connection::open(&self.ledger)?;
+        db.busy_timeout(Duration::from_secs(5))?;
+        db.execute_batch("PRAGMA journal_mode=DELETE;CREATE TABLE IF NOT EXISTS broker_calls(call_id TEXT PRIMARY KEY,scope TEXT NOT NULL,input_tag TEXT NOT NULL,operation_id TEXT NOT NULL,outbox TEXT NOT NULL,prepared INTEGER NOT NULL DEFAULT 0);")?;
+        let scope = json!([
+            self.project_url,
+            self.auth.server_id,
+            self.auth.project_id,
+            self.auth.member_id,
+            key_id(self.key.verifying_key().as_bytes())
+        ])
+        .to_string();
+        let input = json!([operation, args]).to_string();
+        let derived = ring::hmac::sign(
+            &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &self.key.to_bytes()),
+            b"cc-sakura broker call digest v1",
+        );
+        let tag = ring::hmac::sign(
+            &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, derived.as_ref()),
+            input.as_bytes(),
+        );
+        let tag = URL_SAFE_NO_PAD.encode(tag.as_ref());
+        let operation_id = Uuid::new_v4().to_string();
+        ensure!(
+            db.query_row("SELECT COUNT(*) FROM broker_calls", [], |r| r
+                .get::<_, u64>(0))?
+                < 1000000,
+            "broker operation ledger is full"
+        );
+        db.execute(
+            "INSERT OR IGNORE INTO broker_calls(call_id,scope,input_tag,operation_id,outbox) VALUES(?1,?2,?3,?4,?5)",
+            params![
+                call_id,
+                scope,
+                tag,
+                operation_id,
+                self.outbox.to_string_lossy()
+            ],
+        )?;
+        let saved: (String, String, String, String) = db.query_row(
+            "SELECT scope,input_tag,operation_id,outbox FROM broker_calls WHERE call_id=?1",
+            [call_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+        ensure!(
+            saved.0 == scope && saved.1 == tag && saved.3 == self.outbox.to_string_lossy(),
+            "call ID belongs to different content, identity or outbox; do not resend as a new post"
+        );
+        let prepared: bool = db.query_row(
+            "SELECT prepared FROM broker_calls WHERE call_id=?1",
+            [call_id],
+            |r| r.get(0),
+        )?;
+        if prepared {
+            ensure!(
+                self.outbox.exists(),
+                "prepared operation outbox is missing; do not recreate the post"
+            );
+            let exists: bool = self.outbox()?.query_row(
+                "SELECT EXISTS(SELECT 1 FROM signed_outbox WHERE id=?1)",
+                [&saved.2],
+                |r| r.get(0),
+            )?;
+            ensure!(
+                exists,
+                "prepared operation is missing from outbox; do not recreate the post"
+            );
+        }
+        Ok(saved.2)
     }
     async fn call_inner(
         &self,
         http: &reqwest::Client,
         operation: &str,
         args: Value,
+        reserved_id: Option<String>,
     ) -> Result<Value> {
         let mut args = self.target(&args)?;
+        let mut operation_recovery = self.recovery()?;
         let requested_id = args.get("id").cloned();
         let requested_handle = args.get("handle").cloned();
         let op = if matches!(operation, "request_approval" | "decide_approval") {
@@ -1234,14 +1602,14 @@ impl SignedClient {
                 "room key rotation pending; keep the owner's room page open and retry"
             );
             if let Some(key_id) = identity["encryption_key_id"].as_str() {
-                self.sync_room_key(http, key_id).await?;
-                let recovery = self.recovery()?;
+                operation_recovery = Some(self.sync_room_key(http, key_id).await?);
+                let recovery = operation_recovery.clone();
                 ensure!(
                     recovery.as_ref().is_some_and(|r| r.key_id == key_id),
                     "room key is not available"
                 );
             }
-            let recovery = self.recovery()?;
+            let recovery = operation_recovery.clone();
             if recovery.is_some() {
                 ensure!(
                     op == "send"
@@ -1268,7 +1636,7 @@ impl SignedClient {
                 .as_u64()
                 .filter(|id| *id > 0)
                 .context("invalid approval request ID")?;
-            if self.recovery()?.is_some() {
+            if operation_recovery.is_some() {
                 let detail = self
                     .send_action(
                         http,
@@ -1336,12 +1704,14 @@ impl SignedClient {
         }
         if matches!(operation, "request_approval" | "decide_approval") {
             ensure!(
-                self.recovery()?.is_some(),
+                operation_recovery.is_some(),
                 "approval helpers require an encrypted room"
             );
         }
-        let operation_id = matches!(op, "send" | "codec").then(|| Uuid::new_v4().to_string());
-        if let Some(recovery) = self.recovery()? {
+        let reserved = reserved_id.is_some();
+        let operation_id = matches!(op, "send" | "codec")
+            .then(|| reserved_id.unwrap_or_else(|| Uuid::new_v4().to_string()));
+        if let Some(recovery) = operation_recovery.clone() {
             ensure!(op != "codec", "codecs are not supported with encryption");
             if op == "send" {
                 ensure!(
@@ -1380,6 +1750,15 @@ impl SignedClient {
         let action = self.action(op, args, operation_id.clone())?;
         if let Some(id) = &operation_id {
             self.outbox()?.execute("INSERT INTO signed_outbox(id,server_id,project_id,member_id,action,created_at) VALUES(?1,?2,?3,?4,?5,?6)",params![id,self.auth.server_id,self.auth.project_id,self.auth.member_id,action.get(),now()?])?;
+        }
+        if reserved {
+            private_existing(&self.ledger)?;
+            Connection::open(&self.ledger)?.execute(
+                "UPDATE broker_calls SET prepared=1 WHERE operation_id=?1",
+                [operation_id
+                    .as_deref()
+                    .context("reserved operation ID missing")?],
+            )?;
         }
         let result = self.send_action(http, &action).await;
         let value=match (result,&operation_id) {
@@ -1441,6 +1820,11 @@ impl SignedClient {
             .is_some_and(|v| v.contains(&json!(1))))
     }
     pub async fn open_stream(&self, http: &reqwest::Client) -> Result<(reqwest::Response, String)> {
+        crate::quota::stream_start(
+            &url::Url::parse(&self.project_url)?
+                .origin()
+                .ascii_serialization(),
+        )?;
         let mut random = [0u8; 32];
         getrandom::getrandom(&mut random)
             .map_err(|_| anyhow::anyhow!("random source unavailable"))?;
@@ -1452,7 +1836,7 @@ impl SignedClient {
             .header("sakura-stream-client-nonce", &nonce)
             .send()
             .await?;
-        let response = stream_response(response)?;
+        let response = stream_response(response).await?;
         ensure!(
             response
                 .headers()
@@ -1493,6 +1877,11 @@ impl SignedClient {
                 .is_some_and(|v| v > time && v <= time + 60),
             "expired stream challenge"
         );
+        crate::quota::before(
+            &url::Url::parse(&self.project_url)?
+                .origin()
+                .ascii_serialization(),
+        )?;
         let url = url::Url::parse(&format!("{}/api/v2/events/auth", self.project_url))?;
         let base = url::Url::parse(&self.project_url)?;
         let args = self.target(args)?;
@@ -1521,7 +1910,8 @@ impl SignedClient {
                 .body(body)
                 .send()
                 .await?,
-        )?;
+        )
+        .await?;
         Ok(())
     }
     pub async fn events(&self, http: &reqwest::Client, args: &Value) -> Result<reqwest::Response> {
@@ -1753,6 +2143,8 @@ mod tests {
         let bundle = wrapped["bundle"].clone();
         let ready = Arc::new(AtomicBool::new(false));
         let server_ready = ready.clone();
+        let registrations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_registrations = registrations.clone();
         let expected = initial.key.verifying_key();
         let device_id = device.id()?;
         let server = initial.auth.server_id.clone();
@@ -1764,6 +2156,7 @@ mod tests {
             "/owner/project/api/v1/rpc",
             post(move |body: String| {
                 let ready = server_ready.clone();
+                let registrations = server_registrations.clone();
                 let wrapped = wrapped.clone();
                 let device_id = device_id.clone();
                 let bundle = server_bundle.clone();
@@ -1777,7 +2170,10 @@ mod tests {
                     let a = verified.action().unwrap();
                     let result = match a.op.as_str() {
                         "identity" => json!({"encryption_key_id":bundle["key_id"]}),
-                        "encryption-device" => json!({"device_id":device_id}),
+                        "encryption-device" => {
+                            registrations.fetch_add(1, Ordering::SeqCst);
+                            json!({"device_id":device_id})
+                        }
                         "encryption-history" => json!({"history":[]}),
                         "encryption-key" => {
                             if ready.load(Ordering::SeqCst) {
@@ -1820,11 +2216,40 @@ mod tests {
         assert!(error.to_string().contains("delivery pending"));
         assert!(!c.outbox.exists());
         ready.store(true, Ordering::SeqCst);
+        assert_eq!(
+            c.call(&http, "send", args.clone())
+                .await
+                .unwrap_err()
+                .downcast_ref::<StreamFailure>()
+                .unwrap()
+                .code
+                .as_deref(),
+            Some("encryption_key_pending")
+        );
+        // Advance the delivery cooldown without slowing the crypto integration test.
+        c.key_retry.lock().unwrap().clear();
+        let mut waiters = tokio::task::JoinSet::new();
+        for _ in 0..10 {
+            let client = c.clone();
+            let http = http.clone();
+            let key_id = bundle["key_id"].as_str().unwrap().to_owned();
+            waiters.spawn(async move {
+                client
+                    .sync_room_key(&http, &key_id)
+                    .await
+                    .map(|key| key.key_id)
+            });
+        }
+        while let Some(result) = waiters.join_next().await {
+            assert_eq!(result??, bundle["key_id"].as_str().unwrap());
+        }
+        assert_eq!(registrations.load(Ordering::SeqCst), 1);
         assert_eq!(c.call(&http, "send", args.clone()).await?["id"], 1);
         let action: String =
             c.outbox()?
                 .query_row("SELECT action FROM signed_outbox LIMIT 1", [], |r| r.get(0))?;
         assert!(!action.contains("secret agent draft"));
+        assert_eq!(registrations.load(Ordering::SeqCst), 1);
         let persisted =
             fs::read_to_string(c.auth.private_key_file.with_extension("delivery.json"))?;
         assert!(!persisted.contains(bundle["key"].as_str().unwrap()));
@@ -1977,6 +2402,62 @@ mod tests {
                 room_aliases: vec!["old-room".into()],
             },
         )
+    }
+    #[tokio::test]
+    async fn broker_call_reservation_survives_restart_and_rejects_substitution() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut original = client(dir.path())?;
+        original.ledger = dir.path().join("ledger.sqlite3");
+        let id = Uuid::new_v4().to_string();
+        let args = json!({"payload":{"message":"private post"}});
+        let operation = original.reserve_call("send", &args, &id)?;
+        assert_eq!(original.call_status(&id)?["state"], "reserved");
+        let mut restarted = SignedClient::new(
+            &original.project_url,
+            original.auth.clone(),
+            CompatConfig::default(),
+        )?;
+        restarted.ledger = original.ledger.clone();
+        assert_eq!(restarted.reserve_call("send", &args, &id)?, operation);
+        assert!(
+            restarted
+                .reserve_call("send", &json!({"payload":"changed"}), &id)
+                .is_err()
+        );
+        restarted.outbox = dir.path().join("different.sqlite3");
+        assert!(restarted.reserve_call("send", &args, &id).is_err());
+        restarted.outbox = original.outbox.clone();
+        restarted.auth.member_id = Uuid::new_v4().to_string();
+        assert!(restarted.reserve_call("send", &args, &id).is_err());
+        let db = original.outbox()?;
+        db.execute(
+            "INSERT INTO signed_outbox VALUES(?1,?2,?3,?4,?5,?6,1)",
+            params![
+                operation,
+                original.auth.server_id,
+                original.auth.project_id,
+                original.auth.member_id,
+                "{}",
+                json!({"id":42}).to_string()
+            ],
+        )?;
+        assert_eq!(
+            original
+                .call_id(&reqwest::Client::new(), "send", args.clone(), &id)
+                .await?,
+            json!({"id":42})
+        );
+        assert_eq!(original.call_status(&id)?["state"], "complete");
+        assert_eq!(original.call_status(&id)?["result"]["id"], 42);
+        let ledger = Connection::open(&original.ledger)?;
+        let tag: String =
+            ledger.query_row("SELECT input_tag FROM broker_calls", [], |r| r.get(0))?;
+        assert!(!tag.contains("private post"));
+        ledger.execute("UPDATE broker_calls SET prepared=1", [])?;
+        db.execute("DELETE FROM signed_outbox", [])?;
+        assert!(original.reserve_call("send", &args, &id).is_err());
+        assert!(original.call_status(&id).is_err());
+        Ok(())
     }
     #[tokio::test]
     async fn stream_auth_binds_the_original_connection_and_rejects_foreign_challenges() -> Result<()>
@@ -2273,7 +2754,7 @@ mod tests {
         });
         let mut auth = template.auth.clone();
         auth.allow_insecure_loopback = true;
-        let client = SignedClient::new(
+        let mut client = SignedClient::new(
             &format!("http://{address}/owner/project"),
             auth,
             CompatConfig::default(),
@@ -2302,6 +2783,39 @@ mod tests {
         assert_eq!(requests[0].action.get(), requests[1].action.get());
         assert_ne!(requests[0].request_id, requests[1].request_id);
         assert_eq!(requests[0].action()?.operation_id, Some(operation_id));
+        drop(requests);
+        client.ledger = dir.path().join("ledger.sqlite3");
+        fixture.count.store(0, Ordering::SeqCst);
+        fixture.requests.lock().unwrap().clear();
+        let call_id = Uuid::new_v4().to_string();
+        let args = json!({"payload":{"result":"broker recovery"}});
+        assert!(
+            client
+                .call_id(&http, "send", args.clone(), &call_id)
+                .await
+                .is_err()
+        );
+        assert_eq!(client.call_status(&call_id)?["state"], "pending");
+        let mut restarted = SignedClient::new(
+            &client.project_url,
+            client.auth.clone(),
+            CompatConfig::default(),
+        )?;
+        restarted.ledger = client.ledger.clone();
+        assert_eq!(
+            restarted
+                .call_id(&http, "send", args.clone(), &call_id)
+                .await?,
+            json!({"id":7})
+        );
+        assert_eq!(
+            restarted.call_id(&http, "send", args, &call_id).await?,
+            json!({"id":7})
+        );
+        assert_eq!(fixture.count.load(Ordering::SeqCst), 2);
+        let requests = fixture.requests.lock().unwrap();
+        assert_eq!(requests[0].action.get(), requests[1].action.get());
+        assert_ne!(requests[0].request_id, requests[1].request_id);
         drop(requests);
         task.abort();
         Ok(())
