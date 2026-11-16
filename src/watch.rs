@@ -321,7 +321,7 @@ async fn handle(
             }
         }
     }
-    let event = json!({"v":1,"event_id":format!("{}:{}",client.signed.as_ref().unwrap().auth.project_id,id),"room":options.room,"self_member_id":me,"reason":if mentioned{"mention"}else{"reply"},"message":safe_message(message),"context":context.iter().map(safe_message).collect::<Vec<_>>()});
+    let event = json!({"v":1,"event_id":format!("{}:{}",client.auth()?.project_id,id),"room":options.room,"self_member_id":me,"reason":if mentioned{"mention"}else{"reply"},"message":safe_message(message),"context":context.iter().map(safe_message).collect::<Vec<_>>()});
     state.reserve(id, options.max_events_per_hour)?;
     dispatch(options, &event).await?;
     state.ack(id)?;
@@ -338,11 +338,7 @@ pub async fn run(client: &Client, options: Options) -> Result<()> {
         options.handler.is_some() || options.handler_arg.is_empty(),
         "--handler-arg requires --handler"
     );
-    let auth = &client
-        .signed
-        .as_ref()
-        .context("signed profile required")?
-        .auth;
+    let auth = client.auth()?;
     let scope = json!([
         auth.server_id,
         auth.project_id,
@@ -397,39 +393,22 @@ pub async fn run(client: &Client, options: Options) -> Result<()> {
     }
     loop {
         let args = json!({"room":options.room,"after":state.get("cursor")?.unwrap_or(0),"limit":1000,"include_human":false});
-        let stream = client.events(&args).await;
-        let mut stream = match stream {
-            Ok(Some(stream)) => stream,
-            Ok(None) => bail!("signed SSE required"),
-            Err(e) if transient(&e) || e.to_string() == "event connection timed out" => {
-                eprintln!("watch reconnect");
-                client.note_stream_error(&e).await;
-                client.reconnect_wait().await;
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
-        loop {
-            match stream.next().await {
-                Ok(Some(page)) => {
-                    for message in page["messages"].as_array().context("missing messages")? {
-                        if message["id"].as_i64().context("missing message ID")?
-                            > state.get("cursor")?.unwrap_or(0)
-                        {
-                            handle(client, &options, &state, message, &auth.member_id).await?;
-                        }
+        match client.receive(args).await {
+            Ok(page) => {
+                for message in page["messages"].as_array().context("missing messages")? {
+                    if message["id"].as_i64().context("missing message ID")?
+                        > state.get("cursor")?.unwrap_or(0)
+                    {
+                        handle(client, &options, &state, message, &auth.member_id).await?;
                     }
                 }
-                Ok(None) => break,
-                Err(e) if transient(&e) || e.to_string() == "event heartbeat timed out" => {
-                    client.note_stream_error(&e).await;
-                    break;
-                }
-                Err(e) => return Err(e),
             }
+            Err(error) if transient(&error) => {
+                client.note_stream_error(&error).await;
+                client.reconnect_wait().await;
+            }
+            Err(error) => return Err(error),
         }
-        client.stable_connection(stream.stable()).await;
-        client.reconnect_wait().await;
     }
 }
 
