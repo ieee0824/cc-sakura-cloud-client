@@ -2238,6 +2238,22 @@ mod tests {
         );
         // Advance the delivery cooldown without slowing the crypto integration test.
         c.key_retry.lock().unwrap().clear();
+        let mut waiters = tokio::task::JoinSet::new();
+        for _ in 0..10 {
+            let client = c.clone();
+            let http = http.clone();
+            let key_id = bundle["key_id"].as_str().unwrap().to_owned();
+            waiters.spawn(async move {
+                client
+                    .sync_room_key(&http, &key_id)
+                    .await
+                    .map(|key| key.key_id)
+            });
+        }
+        while let Some(result) = waiters.join_next().await {
+            assert_eq!(result??, bundle["key_id"].as_str().unwrap());
+        }
+        assert_eq!(registrations.load(Ordering::SeqCst), 1);
         assert_eq!(c.call(&http, "send", args.clone()).await?["id"], 1);
         let action: String =
             c.outbox()?
@@ -2748,7 +2764,7 @@ mod tests {
         });
         let mut auth = template.auth.clone();
         auth.allow_insecure_loopback = true;
-        let client = SignedClient::new(
+        let mut client = SignedClient::new(
             &format!("http://{address}/owner/project"),
             auth,
             CompatConfig::default(),
@@ -2777,6 +2793,39 @@ mod tests {
         assert_eq!(requests[0].action.get(), requests[1].action.get());
         assert_ne!(requests[0].request_id, requests[1].request_id);
         assert_eq!(requests[0].action()?.operation_id, Some(operation_id));
+        drop(requests);
+        client.ledger = dir.path().join("ledger.sqlite3");
+        fixture.count.store(0, Ordering::SeqCst);
+        fixture.requests.lock().unwrap().clear();
+        let call_id = Uuid::new_v4().to_string();
+        let args = json!({"payload":{"result":"broker recovery"}});
+        assert!(
+            client
+                .call_id(&http, "send", args.clone(), &call_id)
+                .await
+                .is_err()
+        );
+        assert_eq!(client.call_status(&call_id)?["state"], "pending");
+        let mut restarted = SignedClient::new(
+            &client.project_url,
+            client.auth.clone(),
+            CompatConfig::default(),
+        )?;
+        restarted.ledger = client.ledger.clone();
+        assert_eq!(
+            restarted
+                .call_id(&http, "send", args.clone(), &call_id)
+                .await?,
+            json!({"id":7})
+        );
+        assert_eq!(
+            restarted.call_id(&http, "send", args, &call_id).await?,
+            json!({"id":7})
+        );
+        assert_eq!(fixture.count.load(Ordering::SeqCst), 2);
+        let requests = fixture.requests.lock().unwrap();
+        assert_eq!(requests[0].action.get(), requests[1].action.get());
+        assert_ne!(requests[0].request_id, requests[1].request_id);
         drop(requests);
         task.abort();
         Ok(())
