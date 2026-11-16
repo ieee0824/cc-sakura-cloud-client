@@ -10,6 +10,7 @@ mod key_delivery;
 mod limits;
 mod mcp;
 mod metrics;
+mod paths;
 mod quota;
 mod signed;
 mod subscription;
@@ -289,9 +290,10 @@ async fn main() -> Result<()> {
         };
         return broker::manage(&path, action).await;
     }
-    let path = cli.config.unwrap_or_else(|| {
-        PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/ccSakura.toml")
-    });
+    let path = match cli.config {
+        Some(path) => path,
+        None => paths::home()?.join(".config/ccSakura.toml"),
+    };
     #[cfg(unix)]
     if let Command::Proxy { socket } = &cli.command {
         return broker::proxy(socket, &path, false).await;

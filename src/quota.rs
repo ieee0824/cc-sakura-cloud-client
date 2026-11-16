@@ -17,30 +17,27 @@ fn lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
-fn directory() -> PathBuf {
+fn directory() -> Result<PathBuf> {
     #[cfg(test)]
     {
         static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
-        DIR.get_or_init(|| tempfile::tempdir().unwrap())
+        Ok(DIR
+            .get_or_init(|| tempfile::tempdir().unwrap())
             .path()
-            .to_owned()
+            .to_owned())
     }
     #[cfg(not(test))]
     {
-        PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-                .join(".local/state")
-                .into_os_string()
-        }))
-        .join("cc-sakura")
+        crate::paths::state_directory()
     }
 }
-fn path(origin: &str) -> PathBuf {
-    directory().join(format!(
+fn path(origin: &str) -> Result<PathBuf> {
+    Ok(directory()?.join(format!(
         "pause-{:x}.json",
         Sha256::digest(origin.as_bytes())
-    ))
+    )))
 }
+
 fn read(path: &Path) -> Result<Option<Pause>> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
@@ -65,7 +62,7 @@ pub fn before(origin: &str) -> Result<()> {
     let _guard = lock()
         .lock()
         .map_err(|_| anyhow::anyhow!("quota state unavailable"))?;
-    if let Some(pause) = read(&path(origin))? {
+    if let Some(pause) = read(&path(origin)?)? {
         let remaining = pause.until - crate::signed::now()?;
         if remaining > 0 {
             return Err(crate::signed::StreamFailure {
@@ -85,7 +82,7 @@ pub fn note(origin: &str, status: u16, code: Option<&str>, retry_after: u64) -> 
     let _guard = lock()
         .lock()
         .map_err(|_| anyhow::anyhow!("quota state unavailable"))?;
-    let path = path(origin);
+    let path = path(origin)?;
     let pause = Pause {
         until: crate::signed::now()? + retry_after.clamp(1, 86400) as i64,
         status,
@@ -150,7 +147,7 @@ mod tests {
         assert!(error.retry_after > 290);
         assert_eq!(error.code.as_deref(), Some("d1_daily_quota_exceeded"));
         assert!(before("https://unrelated.invalid").is_ok());
-        assert!(read(&path(origin))?.is_some());
+        assert!(read(&path(origin)?)?.is_some());
         note(origin, 503, Some("d1_daily_quota_exceeded"), 1)?;
         assert!(
             before(origin)

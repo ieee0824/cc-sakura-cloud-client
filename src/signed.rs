@@ -814,12 +814,7 @@ impl SignedClient {
             .context("invalid Ed25519 PKCS#8 private key")?;
         let outbox = match &auth.outbox_file {
             Some(path) => path.clone(),
-            None => std::env::var_os("XDG_STATE_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| {
-                    PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state")
-                })
-                .join("cc-sakura/outbox.sqlite3"),
+            None => crate::paths::default_outbox()?,
         };
         ensure!(outbox.is_absolute(), "outbox_file must be absolute");
         Ok(Self {
@@ -836,12 +831,7 @@ impl SignedClient {
             reads: Default::default(),
             registered_device: Default::default(),
             key_retry: Default::default(),
-            ledger: PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap_or_else(|| {
-                PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-                    .join(".local/state")
-                    .into_os_string()
-            }))
-            .join("cc-sakura/broker-operations.sqlite3"),
+            ledger: crate::paths::state_directory()?.join("broker-operations.sqlite3"),
         })
     }
     fn outbox(&self) -> Result<Connection> {
